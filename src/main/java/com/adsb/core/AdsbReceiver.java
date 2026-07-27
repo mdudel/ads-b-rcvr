@@ -175,11 +175,15 @@ public class AdsbReceiver {
         System.out.printf("[INFO] rtl_adsb exited with code %d%n", exit);
     }
 
-    private ProcessBuilder buildProcess() {
+    private ProcessBuilder buildProcess() throws java.io.FileNotFoundException {
         List<String> cmd = new ArrayList<>();
-        String exe = IS_WINDOWS ? "rtl_adsb.exe" : "rtl_adsb";
-        if (rtlPath != null && !rtlPath.isBlank()) exe = rtlPath + File.separator + exe;
-        cmd.add(exe);
+        // Reuse the exact same resolution the pre-flight uses so we never
+        // hand ProcessBuilder a bare filename that would trigger a PATH
+        // walk (which was the leftover bug after the pre-flight landed:
+        // pre-flight said "found in cwd", then buildProcess passed just
+        // "rtl_adsb" as argv[0] and PB threw "Cannot run program").
+        java.io.File exe = requireRtlAdsbExecutable(rtlPath);
+        cmd.add(exe.getAbsolutePath());
         cmd.add("-d"); cmd.add(String.valueOf(deviceIndex));
         if (!"auto".equalsIgnoreCase(gain)) { cmd.add("-g"); cmd.add(gain); }
         if ("raw".equalsIgnoreCase(format)) cmd.add("-V");
@@ -215,17 +219,27 @@ public class AdsbReceiver {
      */
     public static java.io.File requireRtlAdsbExecutable(String rtlPath) throws java.io.FileNotFoundException {
         String exeName = IS_WINDOWS ? "rtl_adsb.exe" : "rtl_adsb";
+        // For the cwd-fallback branch we read user.dir explicitly rather
+        // than new File(".").getAbsoluteFile(). Reason: the JVM caches
+        // the initial cwd at C-level; System.setProperty("user.dir", ...)
+        // does NOT change what File(".") resolves to. Reading user.dir
+        // directly lets our unit tests flip cwd for hermetic runs, and
+        // has zero effect on production (real launches don't move cwd
+        // mid-process).
         java.io.File dir = (rtlPath != null && !rtlPath.isBlank())
                 ? new java.io.File(rtlPath)
-                : new java.io.File(".").getAbsoluteFile();
+                : new java.io.File(System.getProperty("user.dir", "."));
         java.io.File exe = new java.io.File(dir, exeName);
         if (!exe.isFile()) {
             String source = (rtlPath != null && !rtlPath.isBlank())
                     ? "--rtl-path folder"
                     : "current directory";
+            // Normalise the path so the operator sees a clean form
+            // (e.g. "/tmp" not "/tmp/.") in the error message.
+            String shown = dir.toPath().toAbsolutePath().normalize().toString();
             throw new java.io.FileNotFoundException(
                     "[ERROR] " + exeName + " not found in " + source + " ("
-                            + dir.getAbsolutePath() + ").\n"
+                            + shown + ").\n"
                             + "        Either drop " + exeName + " (plus its DLLs) into the launch folder,\n"
                             + "        or pass --rtl-path <dir> pointing at the folder that contains it.\n"
                             + "        Download: https://github.com/rtlsdrblog/rtl-sdr-blog/releases");

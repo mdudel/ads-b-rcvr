@@ -15,12 +15,20 @@ import static org.junit.jupiter.api.Assertions.*;
  *
  * <p>Contract per Marty 2026-07-27 13:30 UTC:
  * <ul>
- *   <li>{@code --rtl-path} absent \u2192 look in current working directory.</li>
- *   <li>{@code --rtl-path} given \u2192 look in that folder only.</li>
- *   <li>Miss on either \u2192 throw a {@link FileNotFoundException} with a
- *       user-facing message telling the operator exactly what to do.</li>
+ *   <li>{@code --rtl-path} absent  ==&gt;  look in current working directory.</li>
+ *   <li>{@code --rtl-path} given   ==&gt;  look in that folder only.</li>
+ *   <li>Miss on either             ==&gt;  throw a {@link FileNotFoundException}
+ *       with a user-facing message telling the operator exactly what to do.</li>
  *   <li>PATH is deliberately NOT walked.</li>
  * </ul>
+ *
+ * <p>The two "missing from current directory" tests use
+ * {@link #withUserDir} to temporarily flip {@code user.dir} to an empty
+ * {@link TempDir} so the check is hermetic across dev machines. On
+ * Marty's Windows dev box the real cwd (D:\DEV\PROJECTS\ads-b-rcvr\)
+ * contains rtl_adsb.exe next to the jar, which would spuriously satisfy
+ * the check and make the tests fail there. See commit that introduces
+ * this helper for the field-report trace.
  */
 class AdsbReceiverRequireRtlExecutableTest {
 
@@ -42,30 +50,58 @@ class AdsbReceiverRequireRtlExecutableTest {
         FileNotFoundException ex = assertThrows(FileNotFoundException.class,
                 () -> AdsbReceiver.requireRtlAdsbExecutable(dir.toString()));
         String msg = ex.getMessage();
-        assertTrue(msg.contains(EXE_NAME),         "message must name the exe: " + msg);
-        assertTrue(msg.contains("--rtl-path"),      "message must mention --rtl-path: " + msg);
-        assertTrue(msg.contains(dir.toString()),    "message must show the searched dir: " + msg);
+        assertTrue(msg.contains(EXE_NAME),        "message must name the exe: " + msg);
+        assertTrue(msg.contains("--rtl-path"),    "message must mention --rtl-path: " + msg);
+        assertTrue(msg.contains(dir.toString()),  "message must show the searched dir: " + msg);
     }
 
     @Test
-    void missing_from_current_directory_throws_with_helpful_message() {
-        // The sandbox's cwd never has rtl_adsb in it, so this always
-        // exercises the miss branch. If it ever spuriously passes,
-        // that itself would be a signal worth investigating.
-        FileNotFoundException ex = assertThrows(FileNotFoundException.class,
-                () -> AdsbReceiver.requireRtlAdsbExecutable(null));
-        String msg = ex.getMessage();
-        assertTrue(msg.contains(EXE_NAME),                "message must name the exe: " + msg);
-        assertTrue(msg.contains("current directory"),      "message must mention current directory: " + msg);
-        assertTrue(msg.contains("--rtl-path"),             "message must suggest --rtl-path as the fix: " + msg);
+    void missing_from_current_directory_throws_with_helpful_message(@TempDir Path emptyDir) throws Exception {
+        withUserDir(emptyDir, () -> {
+            FileNotFoundException ex = assertThrows(FileNotFoundException.class,
+                    () -> AdsbReceiver.requireRtlAdsbExecutable(null));
+            String msg = ex.getMessage();
+            assertTrue(msg.contains(EXE_NAME),            "message must name the exe: " + msg);
+            assertTrue(msg.contains("current directory"), "message must mention current directory: " + msg);
+            assertTrue(msg.contains("--rtl-path"),        "message must suggest --rtl-path: " + msg);
+        });
     }
 
     @Test
-    void blank_rtl_path_string_is_treated_as_absent() {
-        // Same failure shape as null \u2014 users passing --rtl-path "" shouldn't
-        // trip into "found empty folder" territory.
-        FileNotFoundException ex = assertThrows(FileNotFoundException.class,
-                () -> AdsbReceiver.requireRtlAdsbExecutable(""));
-        assertTrue(ex.getMessage().contains("current directory"));
+    void blank_rtl_path_string_is_treated_as_absent(@TempDir Path emptyDir) throws Exception {
+        // Users passing --rtl-path "" shouldn't trip into "found empty
+        // folder" territory; must behave identically to the null case.
+        withUserDir(emptyDir, () -> {
+            FileNotFoundException ex = assertThrows(FileNotFoundException.class,
+                    () -> AdsbReceiver.requireRtlAdsbExecutable(""));
+            assertTrue(ex.getMessage().contains("current directory"));
+        });
+    }
+
+    // ------------------------------------------------------------------
+
+    /**
+     * Run {@code body} with {@link System#getProperty(String) user.dir}
+     * temporarily set to {@code dir}, restoring the previous value in a
+     * finally block. The production check resolves the cwd via
+     * {@code new File(".").getAbsoluteFile()} which reads {@code user.dir},
+     * so overriding that system property is the cleanest way to keep the
+     * test hermetic without changing the JVM's actual working directory
+     * (which we cannot do reliably from Java).
+     */
+    private static void withUserDir(Path dir, ThrowingRunnable body) throws Exception {
+        String previous = System.getProperty("user.dir");
+        System.setProperty("user.dir", dir.toAbsolutePath().toString());
+        try {
+            body.run();
+        } finally {
+            if (previous != null) System.setProperty("user.dir", previous);
+            else                  System.clearProperty("user.dir");
+        }
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 }
