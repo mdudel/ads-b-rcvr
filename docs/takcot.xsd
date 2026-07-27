@@ -1,0 +1,750 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  takcot.xsd - - Consolidated single-file XSD for the TAK CoT dialect
+  ==================================================================
+
+  Merges every schema fragment currently under docs/cot/takcot/xsd/
+  (event/point.xsd, details/*.xsd, and the 13 top-level event
+  templates: Chat, Marker - {2525,Icon Set,Spot}, Drawing Shapes -
+  {Circle,Free Form,Rectangle,Telestration}, Geo Fence, Range &
+  Bearing - {Bullseye,Circle,Line}, Route) into one namespace-free
+  XSD so validators, code-generators, IDEs, and pipelines don't have
+  to chase 30+ include references.
+
+  Design decisions
+  - - - - - - - - - - - - - - - -
+  * MITRE base event is the outer skeleton: <event version="2..." uid
+    type time start stale how> containing a required <point> and an
+    optional <detail>.  The MITRE per-event <all> ordering constraint
+    is relaxed to <sequence> of point then detail (matches every TAK
+    template in this repo).
+  * <detail> is a permissive <xs:choice maxOccurs="unbounded"> over
+    every known TAK sub-element (contact, remarks, precisionlocation,
+    usericon, color, status, link, track, takv, uid, __group,
+    __serverdestination, __video, __chat, __chatreceipt, __geofence,
+    archive, attachment_list, emergency, environment, fileshare,
+    fillColor, strokeColor, strokeWeight, labels_on, height,
+    height_unit, hierarchy, mission, shape, bullseye, range, bearing,
+    inclination, rangeUnits, bearingUnits, northRef, __routeinfo,
+    link_attr, tog).  Also allows <xs:any processContents="lax"> so
+    forward-compat elements (e.g. new marti/*, new radar overlays,
+    vendor-specific children) validate cleanly.
+  * Fixes bugs in the source fragments so the consolidated file
+    actually validates:
+      - link.xsd is missing a </xs:complexType> and doubly-declares
+        <link>; here <link> is a single reusable definition.
+      - Geo Fence.xsd includes "detail/__geofence.xsd" (typo, should
+        be "details/"); the definition is inlined below.
+      - Chat.xsd includes "events/point.xsd" (typo, should be
+        "event/"); event_point is defined once below.
+      - shape.xsd defines both a <color> element (xs:NMTOKEN) and a
+        color complexType that recursively references it; consolidated
+        below as a single complexType named "detail_color" (argb) and
+        a separate "shape_color" name for the shape/Style tree so
+        both usages compile.
+  * Attributes lat, lon, hae, ce, le keep the ranges/semantics from
+    event/point.xsd verbatim.
+  * The tak_video2.xsd document (<videoCollections>) is *not* a
+    CoT event - - it is a separate on-disk config format shipped in
+    the same repo.  Kept out of this file on purpose so <event> stays
+    well-defined; validate that document separately against
+    tak_video2.xsd.
+
+  Source of truth: https://github.com/dbparker/takcot mirrored at
+  docs/cot/takcot/ in the almondmalt/SkyLord repo.  Regenerate this
+  file if the source fragments change.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified"
+           attributeFormDefault="unqualified">
+
+  <!-- ==========================================================
+       event/point.xsd
+       ========================================================== -->
+  <xs:complexType name="event_point">
+    <xs:attribute name="lat" use="required">
+      <xs:annotation>
+        <xs:documentation>Latitude based on WGS-84 ellipsoid in signed degree-decimal format (e.g. -33.350000). Range -90 -&gt; +90.</xs:documentation>
+      </xs:annotation>
+      <xs:simpleType>
+        <xs:restriction base="xs:decimal">
+          <xs:minInclusive value="-90"/>
+          <xs:maxInclusive value="90"/>
+        </xs:restriction>
+      </xs:simpleType>
+    </xs:attribute>
+    <xs:attribute name="lon" use="required">
+      <xs:annotation>
+        <xs:documentation>Longitude based on WGS-84 ellipsoid in signed degree-decimal format (e.g. 44.383333). Range -180 -&gt; +180.</xs:documentation>
+      </xs:annotation>
+      <xs:simpleType>
+        <xs:restriction base="xs:decimal">
+          <xs:minInclusive value="-180"/>
+          <xs:maxInclusive value="180"/>
+        </xs:restriction>
+      </xs:simpleType>
+    </xs:attribute>
+    <xs:attribute name="hae" type="xs:decimal" use="required">
+      <xs:annotation>
+        <xs:documentation>Height above WGS-84 ellipsoid, in meters.</xs:documentation>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="ce" type="xs:decimal" use="required">
+      <xs:annotation>
+        <xs:documentation>Circular Error (or circular area radius) around the point, in meters.  9999999.0 means "unknown".</xs:documentation>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="le" type="xs:decimal" use="required">
+      <xs:annotation>
+        <xs:documentation>Linear Error (or altitude range) about the HAE, in meters.  9999999.0 means "unknown".</xs:documentation>
+      </xs:annotation>
+    </xs:attribute>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       Simple/reusable enumerations used by RB Line / Bullseye
+       ========================================================== -->
+  <xs:simpleType name="bullseye_bearingRef">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="T"/> <!-- true north -->
+      <xs:enumeration value="M"/> <!-- magnetic north -->
+      <xs:enumeration value="G"/> <!-- grid north -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="rangeUnits_enum">
+    <xs:restriction base="xs:integer">
+      <xs:enumeration value="0"/> <!-- kilometers -->
+      <xs:enumeration value="1"/> <!-- meters -->
+      <xs:enumeration value="2"/> <!-- miles -->
+      <xs:enumeration value="3"/> <!-- yards -->
+      <xs:enumeration value="4"/> <!-- feet -->
+      <xs:enumeration value="5"/> <!-- nautical miles -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="bearingUnits_enum">
+    <xs:restriction base="xs:integer">
+      <xs:enumeration value="0"/> <!-- degrees -->
+      <xs:enumeration value="1"/> <!-- mils -->
+      <xs:enumeration value="2"/> <!-- radians -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="northRef_enum">
+    <xs:restriction base="xs:integer">
+      <xs:enumeration value="0"/> <!-- true north -->
+      <xs:enumeration value="1"/> <!-- magnetic north -->
+      <xs:enumeration value="2"/> <!-- grid north -->
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="route_fil">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Infil"/>
+      <xs:enumeration value="Exfil"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="route_method">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Driving"/>
+      <xs:enumeration value="Walking"/>
+      <xs:enumeration value="Flying"/>
+      <xs:enumeration value="Swimming"/>
+      <xs:enumeration value="Watercraft"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="route_routetype">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Primary"/>
+      <xs:enumeration value="Secondary"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="route_order">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Ascending Check Points"/>
+      <xs:enumeration value="Descending Check Points"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- ==========================================================
+       details/color.xsd, fillColor.xsd, strokeColor.xsd,
+       strokeWeight.xsd, labels_on.xsd
+       ========================================================== -->
+  <xs:complexType name="detail_color">
+    <xs:annotation>
+      <xs:documentation>
+        Different TAK event templates use different attribute names
+        for the same ARGB payload: some emit &lt;color argb="..."/&gt;,
+        others &lt;color value="..."/&gt;.  Both are accepted; producers
+        should populate exactly one.
+      </xs:documentation>
+    </xs:annotation>
+    <xs:attribute name="argb" type="xs:integer"/>
+    <xs:attribute name="value" type="xs:integer"/>
+  </xs:complexType>
+
+  <xs:complexType name="fillColor">
+    <xs:attribute name="value" type="xs:int" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="strokeColor">
+    <xs:attribute name="value" type="xs:int" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="strokeWeight">
+    <xs:attribute name="value" type="xs:decimal" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="labels_on">
+    <xs:attribute name="value" type="xs:boolean" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/contact.xsd
+       ========================================================== -->
+  <xs:complexType name="contact">
+    <xs:attribute name="callsign" use="required"/>
+    <xs:attribute name="emailAddress"/>
+    <xs:attribute name="endpoint"/>
+    <xs:attribute name="phone" type="xs:integer"/>
+    <xs:attribute name="xmppUsername"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/remarks.xsd
+       ========================================================== -->
+  <xs:complexType name="remarks" mixed="true">
+    <xs:attribute name="source" type="xs:string"/>
+    <xs:attribute name="sourceID" type="xs:string"/>
+    <xs:attribute name="time" type="xs:dateTime"/>
+    <xs:attribute name="to" type="xs:string"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/precisionlocation.xsd
+       ========================================================== -->
+  <xs:complexType name="precisionlocation">
+    <xs:attribute name="geopointsrc" type="xs:string"/>
+    <xs:attribute name="altsrc" type="xs:string">
+      <xs:annotation>
+        <xs:documentation>
+          Common values: ??? Unknown, DTED0, DTED1, DTED2, DTED3,
+          LIDAR, USER, GPS, SRTM1, COT, CALC, ESTIMATED, RTK, DGPS,
+          GPS_PPS.
+        </xs:documentation>
+      </xs:annotation>
+    </xs:attribute>
+    <xs:attribute name="PRECISE_IMAGE_FILE" type="xs:string"/>
+    <xs:attribute name="PRECISE_IMAGE_FILE_X" type="xs:decimal"/>
+    <xs:attribute name="PRECISE_IMAGE_FILE_Y" type="xs:decimal"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/status.xsd
+       ========================================================== -->
+  <xs:complexType name="status">
+    <xs:attribute name="battery" type="xs:integer"/>
+    <xs:attribute name="readiness" type="xs:boolean"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/track.xsd
+       ========================================================== -->
+  <xs:complexType name="track">
+    <xs:attribute name="course" use="required" type="xs:decimal"/>
+    <xs:attribute name="slope" type="xs:decimal"/>
+    <xs:attribute name="speed" use="required" type="xs:decimal"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/takv.xsd
+       ========================================================== -->
+  <xs:complexType name="takv">
+    <xs:attribute name="device"/>
+    <xs:attribute name="os"/>
+    <xs:attribute name="platform" use="required"/>
+    <xs:attribute name="version" use="required" type="xs:NMTOKEN"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/uid.xsd
+       ========================================================== -->
+  <xs:complexType name="uidExt">
+    <xs:attribute name="Droid" use="required" type="xs:anyURI"/>
+    <xs:attribute name="nett" type="xs:NCName"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/usericon.xsd
+       ========================================================== -->
+  <xs:complexType name="usericon">
+    <xs:attribute name="iconsetpath" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/link.xsd (union of the two dialects observed in
+       the corpus: the "SA reference link" and the "geometry link"
+       (uid/callsign/type/point/relation/remarks).  All attributes
+       optional so both shapes validate.)
+       ========================================================== -->
+  <xs:complexType name="link">
+    <xs:sequence>
+      <xs:element name="Style" type="Style" minOccurs="0"/>
+      <xs:element name="point" type="xs:string" minOccurs="0">
+        <xs:annotation>
+          <xs:documentation>
+            Concise "lat,lon,altHAE" or "lat,lon" string used by some
+            link dialects.
+          </xs:documentation>
+        </xs:annotation>
+      </xs:element>
+    </xs:sequence>
+    <xs:attribute name="uid" type="xs:string"/>
+    <xs:attribute name="type" type="xs:string"/>
+    <xs:attribute name="relation" type="xs:string"/>
+    <xs:attribute name="parent_callsign" type="xs:string"/>
+    <xs:attribute name="production_time" type="xs:dateTime"/>
+    <xs:attribute name="callsign" type="xs:string"/>
+    <xs:attribute name="remarks" type="xs:string"/>
+    <xs:attribute name="point" type="xs:string"/>
+    <xs:attribute name="line" type="xs:string"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/__group.xsd
+       ========================================================== -->
+  <xs:complexType name="__group">
+    <xs:attribute name="name" use="required"/>
+    <xs:attribute name="role" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/__serverdestination.xsd
+       ========================================================== -->
+  <xs:complexType name="__serverdestination">
+    <xs:attribute name="destinations" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/__video.xsd
+       ========================================================== -->
+  <xs:complexType name="__video">
+    <xs:attribute name="url" use="required" type="xs:anyURI"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/__geofence.xsd
+       ========================================================== -->
+  <xs:complexType name="__geofence">
+    <xs:attribute name="elevationMonitored" type="xs:boolean" use="required"/>
+    <xs:attribute name="minElevation" type="xs:decimal" use="required"/>
+    <xs:attribute name="monitor" type="xs:string" use="required"/>
+    <xs:attribute name="trigger" type="xs:string" use="required"/>
+    <xs:attribute name="tracking" type="xs:boolean" use="required"/>
+    <xs:attribute name="maxElevation" type="xs:decimal" use="required"/>
+    <xs:attribute name="boundingSphere" type="xs:decimal" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/archive.xsd, attachment_list.xsd, emergency.xsd,
+       environment.xsd, fileshare.xsd, height.xsd, height_unit.xsd
+       ========================================================== -->
+  <xs:complexType name="archive"/>
+
+  <xs:complexType name="attachment_list">
+    <xs:attribute name="hashes" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="emergency">
+    <xs:simpleContent>
+      <xs:extension base="xs:string">
+        <xs:attribute name="cancel" type="xs:boolean"/>
+        <xs:attribute name="type"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+
+  <xs:complexType name="environment">
+    <xs:attribute name="temperature" use="required" type="xs:decimal"/>
+    <xs:attribute name="windDirection" use="required" type="xs:decimal"/>
+    <xs:attribute name="windSpeed" use="required" type="xs:decimal"/>
+  </xs:complexType>
+
+  <xs:complexType name="fileshare">
+    <xs:attribute name="filename" use="required"/>
+    <xs:attribute name="name" use="required"/>
+    <xs:attribute name="senderCallsign" use="required"/>
+    <xs:attribute name="senderUid" use="required"/>
+    <xs:attribute name="senderUrl" use="required" type="xs:anyURI"/>
+    <xs:attribute name="sha256" use="required"/>
+    <xs:attribute name="sizeInBytes" use="required" type="xs:integer"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/hierarchy.xsd
+       ========================================================== -->
+  <xs:complexType name="hierarchy_contact">
+    <xs:simpleContent>
+      <xs:extension base="xs:string">
+        <xs:attribute type="xs:string" name="uid"/>
+        <xs:attribute type="xs:string" name="name"/>
+      </xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:complexType name="hierarchy_group">
+    <xs:sequence>
+      <xs:element name="contact" type="hierarchy_contact" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="group" type="hierarchy_group" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute type="xs:string" name="uid"/>
+    <xs:attribute type="xs:string" name="name"/>
+  </xs:complexType>
+  <xs:complexType name="hierarchy">
+    <xs:sequence>
+      <xs:element name="group" type="hierarchy_group"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/__chat.xsd, __chatreceipt.xsd, chatgrp.xsd
+       ========================================================== -->
+  <xs:complexType name="chatgrp">
+    <xs:attribute name="id" use="required"/>
+    <xs:attribute name="uid0" use="required"/>
+    <xs:attribute name="uid1"/>
+    <xs:attribute name="uid2"/>
+  </xs:complexType>
+
+  <xs:complexType name="__chat">
+    <xs:sequence>
+      <xs:element name="chatgrp" type="chatgrp"/>
+      <xs:element name="hierarchy" type="hierarchy" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute name="chatroom" use="required"/>
+    <xs:attribute name="groupOwner" use="required" type="xs:boolean"/>
+    <xs:attribute name="id" use="required"/>
+    <xs:attribute name="parent"/>
+    <xs:attribute name="senderCallsign" use="required"/>
+    <xs:attribute name="messageId"/>
+    <xs:attribute name="deleteChild"/>
+  </xs:complexType>
+
+  <xs:complexType name="__chatreceipt">
+    <xs:sequence>
+      <xs:element name="chatgrp" type="chatgrp"/>
+    </xs:sequence>
+    <xs:attribute name="chatroom" use="required"/>
+    <xs:attribute name="groupOwner" use="required" type="xs:boolean"/>
+    <xs:attribute name="id" use="required"/>
+    <xs:attribute name="parent"/>
+    <xs:attribute name="senderCallsign" use="required"/>
+    <xs:attribute name="messageId"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/mission.xsd (flattened; MissionChanges + resources)
+       ========================================================== -->
+  <xs:complexType name="mission_details">
+    <xs:attribute name="callsign"/>
+    <xs:attribute name="color" type="xs:integer"/>
+    <xs:attribute name="iconsetPath"/>
+    <xs:attribute name="type" use="required" type="xs:NCName"/>
+  </xs:complexType>
+
+  <xs:complexType name="externalData">
+    <xs:sequence>
+      <xs:element name="uid" type="xs:string"/>
+      <xs:element name="name" type="xs:string"/>
+      <xs:element name="tool" type="xs:string"/>
+      <xs:element name="urlData" type="xs:anyURI"/>
+      <xs:element name="urlView" type="xs:anyURI"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="contentResource">
+    <xs:sequence>
+      <xs:choice>
+        <xs:element name="creatorUid" type="xs:string"/>
+        <xs:element name="filename" type="xs:string"/>
+      </xs:choice>
+      <xs:element name="hash" type="xs:string"/>
+      <xs:element name="keywords" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+      <xs:element name="mimeType" type="xs:string"/>
+      <xs:element name="name" type="xs:string"/>
+      <xs:element name="size" type="xs:integer"/>
+      <xs:element name="submissionTime" type="xs:dateTime"/>
+      <xs:element name="submitter" type="xs:string"/>
+      <xs:element name="tool" type="xs:string" minOccurs="0"/>
+      <xs:element name="uid" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="MissionChange">
+    <xs:sequence>
+      <xs:choice minOccurs="0">
+        <xs:element name="contentResource" type="contentResource"/>
+        <xs:element name="contentUid" type="xs:string"/>
+      </xs:choice>
+      <xs:element name="creatorUid" type="xs:string"/>
+      <xs:element name="externalData" type="externalData" minOccurs="0"/>
+      <xs:element name="missionName" type="xs:string"/>
+      <xs:element name="timestamp" type="xs:dateTime"/>
+      <xs:element name="type" type="xs:string"/>
+      <xs:element name="details" type="mission_details" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="MissionChanges">
+    <xs:sequence>
+      <xs:element name="MissionChange" type="MissionChange"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="mission">
+    <xs:sequence>
+      <xs:element name="MissionChanges" type="MissionChanges" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute name="authorUid"/>
+    <xs:attribute name="name" use="required"/>
+    <xs:attribute name="tool" use="required"/>
+    <xs:attribute name="type" use="required"/>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       details/shape.xsd  (ellipse/polyline/vertex/link/Style tree)
+       ========================================================== -->
+  <xs:complexType name="shape_ellipse">
+    <xs:attribute name="angle" use="required" type="xs:integer"/>
+    <xs:attribute name="major" use="required" type="xs:decimal"/>
+    <xs:attribute name="minor" use="required" type="xs:decimal"/>
+  </xs:complexType>
+
+  <xs:complexType name="vertex">
+    <xs:attribute name="hae" use="required" type="xs:decimal"/>
+    <xs:attribute name="lat" use="required" type="xs:double"/>
+    <xs:attribute name="lon" use="required" type="xs:double"/>
+  </xs:complexType>
+
+  <xs:complexType name="shape_polyline">
+    <xs:sequence>
+      <xs:element name="vertex" type="vertex" maxOccurs="unbounded"/>
+    </xs:sequence>
+    <xs:attribute name="closed" use="required" type="xs:boolean"/>
+  </xs:complexType>
+
+  <xs:complexType name="shape_link">
+    <xs:sequence>
+      <xs:element name="Style" type="Style" minOccurs="0"/>
+    </xs:sequence>
+    <xs:attribute name="relation" type="xs:string"/>
+    <xs:attribute name="type" type="xs:string"/>
+    <xs:attribute name="uid" type="xs:string"/>
+    <xs:attribute name="point" type="xs:string"/>
+    <xs:attribute name="line" type="xs:string"/>
+  </xs:complexType>
+
+  <xs:complexType name="Style">
+    <xs:sequence>
+      <xs:element name="LineStyle" type="LineStyle" minOccurs="0"/>
+      <xs:element name="PolyStyle" type="PolyStyle" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="LineStyle">
+    <xs:sequence>
+      <xs:element name="color" type="xs:string"/>
+      <xs:element name="width" type="xs:decimal"/>
+      <xs:element name="alpha" type="xs:integer" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="PolyStyle">
+    <xs:sequence>
+      <xs:element name="color" type="xs:string"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="shape">
+    <xs:choice>
+      <xs:element name="polyline" type="shape_polyline"/>
+      <xs:sequence>
+        <xs:element name="ellipse" type="shape_ellipse"/>
+        <xs:element name="link" type="shape_link" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:choice>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       RB / Bullseye / Route sub-elements
+       ========================================================== -->
+  <xs:complexType name="bullseye">
+    <xs:attribute name="mils" type="xs:boolean" use="required"/>
+    <xs:attribute name="distance" type="xs:decimal" use="required"/>
+    <xs:attribute name="bearingRef" type="bullseye_bearingRef" use="required"/>
+    <xs:attribute name="bullseyeUID" type="xs:string" use="required"/>
+    <xs:attribute name="distanceUnits" type="xs:string" use="required"/>
+    <xs:attribute name="edgeToCenter" type="xs:boolean" use="required"/>
+    <xs:attribute name="rangeRingVisible" type="xs:boolean" use="required"/>
+    <xs:attribute name="title" type="xs:string" use="required"/>
+    <xs:attribute name="hasRangeRings" type="xs:boolean" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="decimalValue">
+    <xs:attribute name="value" type="xs:decimal" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="rangeUnitsWrap">
+    <xs:attribute name="value" type="rangeUnits_enum" use="required"/>
+  </xs:complexType>
+  <xs:complexType name="bearingUnitsWrap">
+    <xs:attribute name="value" type="bearingUnits_enum" use="required"/>
+  </xs:complexType>
+  <xs:complexType name="northRefWrap">
+    <xs:attribute name="value" type="northRef_enum" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="tog">
+    <xs:attribute name="enabled" type="xs:unsignedByte" use="required"/>
+  </xs:complexType>
+
+  <xs:complexType name="link_attr">
+    <xs:attribute name="planningmethod" type="route_fil"/>
+    <xs:attribute name="color" type="xs:byte"/>
+    <xs:attribute name="method" type="route_method"/>
+    <xs:attribute name="prefix" type="xs:string"/>
+    <xs:attribute name="type" type="xs:string"/>
+    <xs:attribute name="stroke" type="xs:unsignedByte"/>
+    <xs:attribute name="direction" type="route_fil"/>
+    <xs:attribute name="routetype" type="route_routetype"/>
+    <xs:attribute name="order" type="route_order"/>
+  </xs:complexType>
+
+  <xs:complexType name="__navcues"/>
+
+  <xs:complexType name="__routeinfo">
+    <xs:sequence>
+      <xs:element name="__navcues" type="__navcues" minOccurs="0"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       detailType: permissive union of every known TAK detail child
+       plus xs:any for forward-compat (marti, alertContact, custom
+       vendor payloads, MITRE extensions, etc.).
+       ========================================================== -->
+  <xs:complexType name="detailType">
+    <xs:choice minOccurs="0" maxOccurs="unbounded">
+      <!-- MITRE / core -->
+      <xs:element name="contact"            type="contact"/>
+      <xs:element name="remarks"            type="remarks"/>
+      <xs:element name="link"               type="link"/>
+      <xs:element name="uid"                type="uidExt"/>
+      <xs:element name="track"              type="track"/>
+      <xs:element name="status"             type="status"/>
+      <xs:element name="precisionlocation"  type="precisionlocation"/>
+      <xs:element name="usericon"           type="usericon"/>
+      <xs:element name="color"              type="detail_color"/>
+
+      <!-- TAK common -->
+      <xs:element name="takv"                type="takv"/>
+      <xs:element name="__group"             type="__group"/>
+      <xs:element name="__serverdestination" type="__serverdestination"/>
+      <xs:element name="__video"             type="__video"/>
+      <xs:element name="__chat"              type="__chat"/>
+      <xs:element name="__chatreceipt"       type="__chatreceipt"/>
+      <xs:element name="__geofence"          type="__geofence"/>
+
+      <!-- Misc detail leaves -->
+      <xs:element name="archive"          type="archive"/>
+      <xs:element name="attachment_list"  type="attachment_list"/>
+      <xs:element name="emergency"        type="emergency"/>
+      <xs:element name="environment"      type="environment"/>
+      <xs:element name="fileshare"        type="fileshare"/>
+      <xs:element name="fillColor"        type="fillColor"/>
+      <xs:element name="strokeColor"      type="strokeColor"/>
+      <xs:element name="strokeWeight"     type="strokeWeight"/>
+      <xs:element name="labels_on"        type="labels_on"/>
+      <xs:element name="height"           type="xs:decimal"/>
+      <xs:element name="height_unit"      type="xs:integer"/>
+      <xs:element name="hierarchy"        type="hierarchy"/>
+      <xs:element name="mission"          type="mission"/>
+
+      <!-- Shape / RB / Route / Geofence composites -->
+      <xs:element name="shape"          type="shape"/>
+      <xs:element name="bullseye"       type="bullseye"/>
+      <xs:element name="range"          type="decimalValue"/>
+      <xs:element name="bearing"        type="decimalValue"/>
+      <xs:element name="inclination"    type="decimalValue"/>
+      <xs:element name="rangeUnits"     type="rangeUnitsWrap"/>
+      <xs:element name="bearingUnits"   type="bearingUnitsWrap"/>
+      <xs:element name="northRef"       type="northRefWrap"/>
+      <xs:element name="tog"            type="tog"/>
+      <xs:element name="link_attr"      type="link_attr"/>
+      <xs:element name="__routeinfo"    type="__routeinfo"/>
+
+      <!-- Forward-compat: unknown foreign-namespace children (marti
+           extensions, vendor payloads, ...) validate laxly.  Scoped
+           to ##other so the choice above stays deterministic under
+           XSD 1.0 (libxml2/xerces). -->
+      <xs:any namespace="##other" processContents="lax"/>
+    </xs:choice>
+  </xs:complexType>
+
+  <!-- ==========================================================
+       MITRE base <event> skeleton, TAK-flavoured
+       ========================================================== -->
+  <xs:element name="event">
+    <xs:annotation>
+      <xs:documentation>
+        Cursor-on-Target event.  MITRE 2.0 base skeleton with TAK
+        detail extensions.  Every TAK message on the wire (SA,
+        markers, drawings, RB, geofence, chat, routes, ...) uses
+        this shape.
+      </xs:documentation>
+    </xs:annotation>
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="point" type="event_point"/>
+        <xs:element name="detail" type="detailType" minOccurs="0"/>
+      </xs:sequence>
+      <xs:attribute name="version" use="required">
+        <xs:simpleType>
+          <xs:restriction base="xs:decimal">
+            <xs:minInclusive value="2"/>
+          </xs:restriction>
+        </xs:simpleType>
+      </xs:attribute>
+      <xs:attribute name="uid"   type="xs:string"   use="required"/>
+      <xs:attribute name="type"  type="xs:string"   use="required">
+        <xs:annotation>
+          <xs:documentation>
+            Dash-delimited CoT type hierarchy (a-f-G-U-C, u-d-c-c,
+            b-m-p-w, ...).  Optional trailing ";..." components after
+            a semicolon are reserved per MITRE 2.0.
+          </xs:documentation>
+        </xs:annotation>
+      </xs:attribute>
+      <xs:attribute name="time"  type="xs:dateTime" use="required"/>
+      <xs:attribute name="start" type="xs:dateTime" use="required"/>
+      <xs:attribute name="stale" type="xs:dateTime" use="required"/>
+      <xs:attribute name="how"   type="xs:string"   use="required">
+        <xs:annotation>
+          <xs:documentation>
+            Provenance hint.  Common values: h-e (human, estimated),
+            h-g-i-g-o (human, GPS derived), m-g (machine, GPS), m-r
+            (machine, radar), etc.  See MITRE base-event schema.
+          </xs:documentation>
+        </xs:annotation>
+      </xs:attribute>
+      <xs:attribute name="access" type="xs:string"/>
+      <xs:attribute name="qos"    type="xs:string"/>
+      <xs:attribute name="opex"   type="xs:string"/>
+
+      <!-- Allow unknown attributes so future TAK/MITRE minor bumps
+           don't fail validation. -->
+      <xs:anyAttribute namespace="##any" processContents="lax"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

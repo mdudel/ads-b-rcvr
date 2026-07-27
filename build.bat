@@ -1,4 +1,4 @@
-@echo off
+@echo on
 REM ============================================================
 REM  build.bat — Build adsb-forwarder fat JAR with Maven
 REM
@@ -26,7 +26,7 @@ if errorlevel 1 (
 )
 
 echo [BUILD] Building project...
-mvn package -q -DskipTests
+mvn clean package
 
 if errorlevel 1 (
     echo [ERROR] Build failed. Run "mvn package" for details.
