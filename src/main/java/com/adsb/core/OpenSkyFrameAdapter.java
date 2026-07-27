@@ -61,6 +61,56 @@ public final class OpenSkyFrameAdapter {
     private final ConcurrentMap<String, PositionDecoder> positionDecoders = new ConcurrentHashMap<>();
 
     /**
+     * Per-ICAO record of the last position we accepted. Used by
+     * {@link #sanityCheckPosition} to reject frames whose implied
+     * speed since the last accepted position exceeds
+     * {@link #MAX_PLAUSIBLE_SPEED_KTS}.
+     *
+     * <p>Written on ACCEPT only, never on reject -- rejected positions
+     * leave the aircraft at its last known good location downstream
+     * (map, table, CoT connectors) per Marty's 2026-07-27 15:35 UTC
+     * direction. The next in-range frame will move it.
+     */
+    private final ConcurrentMap<String, LastGoodPosition> lastGoodPositions = new ConcurrentHashMap<>();
+
+    /**
+     * Max plausible aircraft ground speed, knots. Concorde cruised at
+     * ~1350 kts; military jets at combat rarely exceed this for more
+     * than seconds. 1200 kts is a fat-margin sanity ceiling that
+     * still catches the longitude-flip glitches Marty saw on SkyLord
+     * 2026-07-27 15:30 UTC (~500 nm jumps between frames = implied
+     * speed of ~1.8 million kts).
+     */
+    static final double MAX_PLAUSIBLE_SPEED_KTS = 1200.0;
+
+    /**
+     * Ignore the last-good check when the previous accepted frame is
+     * older than this many seconds. An aircraft that drops out of
+     * range for a minute may legitimately reappear 100 nm away -- we
+     * can't distinguish that from a glitch, so let OpenSky's own
+     * reasonableness check be the only gate at that point.
+     */
+    static final double LAST_GOOD_TTL_SECONDS = 60.0;
+
+    /** Per-ICAO rate-limit for the reject WARN so a glitchy aircraft doesn't spam stderr. */
+    private static final long REJECT_WARN_INTERVAL_MS = 5_000L;
+    private final ConcurrentMap<String, Long> lastRejectWarnMs = new ConcurrentHashMap<>();
+
+    /** Last accepted position for one ICAO. Package-private for tests. */
+    record LastGoodPosition(double lat, double lon, double timeSec) {}
+
+    /**
+     * Test-only hook: pre-seed the last-good record for an ICAO so a
+     * unit test can exercise the speed-check path without having to
+     * push a real ADS-B frame through the whole decode pipeline.
+     * Production code should never call this.
+     */
+    void seedLastGoodForTest(String icaoHex, double lat, double lon, double timeSec) {
+        lastGoodPositions.put(icaoHex.toUpperCase(),
+                new LastGoodPosition(lat, lon, timeSec));
+    }
+
+    /**
      * Decode one AVR line into a typed {@link AdsbFrame}. Returns
      * {@code null} when the frame is malformed, unsupported, or (for
      * position frames) when the even+odd pair hasn't yet arrived so an
@@ -121,7 +171,69 @@ public final class OpenSkyFrameAdapter {
      * currently only one decoder thread exists.
      */
     void evict(String icaoHex) {
-        if (icaoHex != null) positionDecoders.remove(icaoHex.toUpperCase());
+        if (icaoHex != null) {
+            String key = icaoHex.toUpperCase();
+            positionDecoders.remove(key);
+            lastGoodPositions.remove(key);
+            lastRejectWarnMs.remove(key);
+        }
+    }
+
+    /**
+     * Validate lat/lon range + plausibility of implied speed since the
+     * last accepted position. Package-private so tests can drive it
+     * directly without going through the full decode pipeline.
+     *
+     * @return true if the position should be accepted, false to reject
+     *         (and keep the previous good position downstream)
+     */
+    boolean sanityCheckPosition(String icao, double lat, double lon, double timeSec) {
+        // Rule 1: range + NaN check.
+        if (Double.isNaN(lat) || Double.isNaN(lon)
+                || lat < -90.0 || lat > 90.0
+                || lon < -180.0 || lon > 180.0) {
+            warnReject(icao, "out-of-range lat=" + lat + " lon=" + lon);
+            return false;
+        }
+
+        // Rule 2: implied-speed check vs last accepted position.
+        LastGoodPosition last = lastGoodPositions.get(icao);
+        if (last == null) return true;                    // first fix; nothing to compare
+        double dtSec = timeSec - last.timeSec();
+        if (dtSec <= 0.0) return true;                    // out-of-order or same timestamp
+        if (dtSec > LAST_GOOD_TTL_SECONDS) return true;   // stale last-good; skip check
+
+        double distNm = haversineNm(last.lat(), last.lon(), lat, lon);
+        double impliedKts = distNm / (dtSec / 3600.0);
+        if (impliedKts > MAX_PLAUSIBLE_SPEED_KTS) {
+            warnReject(icao, String.format(
+                    "implied speed %.0f kts over %.1fs (%.1f nm) exceeds %.0f kts ceiling",
+                    impliedKts, dtSec, distNm, MAX_PLAUSIBLE_SPEED_KTS));
+            return false;
+        }
+        return true;
+    }
+
+    /** Great-circle distance in nautical miles. */
+    static double haversineNm(double lat1, double lon1, double lat2, double lon2) {
+        double R_NM = 3440.065; // mean Earth radius in nm
+        double phi1 = Math.toRadians(lat1);
+        double phi2 = Math.toRadians(lat2);
+        double dPhi = Math.toRadians(lat2 - lat1);
+        double dLam = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(dPhi / 2) * Math.sin(dPhi / 2)
+                 + Math.cos(phi1) * Math.cos(phi2)
+                 * Math.sin(dLam / 2) * Math.sin(dLam / 2);
+        return 2 * R_NM * Math.asin(Math.min(1.0, Math.sqrt(a)));
+    }
+
+    /** Rate-limited per-ICAO WARN so glitchy frames don't spam stderr. */
+    private void warnReject(String icao, String detail) {
+        long now = System.currentTimeMillis();
+        Long prev = lastRejectWarnMs.get(icao);
+        if (prev != null && now - prev < REJECT_WARN_INTERVAL_MS) return;
+        lastRejectWarnMs.put(icao, now);
+        System.err.printf("[WARN] Rejected implausible position for %s: %s%n", icao, detail);
     }
 
     /** @return count of per-aircraft position decoders cached. Test hook. */
@@ -153,8 +265,8 @@ public final class OpenSkyFrameAdapter {
         PositionDecoder pd = positionDecoders.computeIfAbsent(icao, k -> new PositionDecoder());
         Position p = pd.decodePosition(timeSec, pos);
         if (p == null || p.getLatitude() == null || p.getLongitude() == null) {
-            // Even+odd pair not yet complete, or straddle-error detected \u2014
-            // wait for next matching frame.
+            // Even+odd pair not yet complete, or straddle-error detected
+            // -- wait for next matching frame.
             return null;
         }
         if (!p.isReasonable()) {
@@ -163,6 +275,20 @@ public final class OpenSkyFrameAdapter {
             // rather than push a suspect fix into TAK.
             return null;
         }
+
+        // Second-layer sanity check (Marty 2026-07-27 15:35 UTC, SkyLord
+        // screenshot showed jumps of ~500 nm between frames): OpenSky's
+        // isReasonable() catches most bad frames but occasionally lets a
+        // wild-longitude blip through. Reject positions that are out of
+        // range OR would imply an aircraft moved faster than
+        // MAX_PLAUSIBLE_SPEED_KTS since our last accepted position. On
+        // reject we keep the previous good position downstream by
+        // returning null (state store keeps whatever it had).
+        if (!sanityCheckPosition(icao, p.getLatitude(), p.getLongitude(), timeSec)) {
+            return null;
+        }
+        lastGoodPositions.put(icao,
+                new LastGoodPosition(p.getLatitude(), p.getLongitude(), timeSec));
 
         int altFt = Integer.MIN_VALUE;
         if (pos.hasAltitude()) {
