@@ -21,7 +21,6 @@ import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.Graphics2D;
-import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.geom.AffineTransform;
@@ -42,13 +41,14 @@ import java.util.List;
  * <p>Repaint cadence: state-store updates trigger a coalesced repaint
  * via a 250 ms {@link Timer} (four frames per second is enough for
  * ADS-B tracks; painting on every update would spin the EDT with
- * ~40 aircraft \u00d7 2 Hz = 80 repaints/second).
+ * ~40 aircraft x 2 Hz = 80 repaints/second).
  */
 public final class MapPanel extends JPanel {
 
     private final JXMapViewer map;
     private final AircraftStateStore store;
     private volatile boolean repaintPending;
+    private volatile boolean hasAutoFit;
     private final Timer repaintCoalescer;
 
     public MapPanel(AircraftStateStore store) {
@@ -57,11 +57,29 @@ public final class MapPanel extends JPanel {
 
         this.map = new JXMapViewer();
 
-        // OSM standard tiles \u2014 works out-of-the-box, no attribution setup needed
-        // beyond OSM's usage policy (they ask for a user agent; we set one below).
-        TileFactoryInfo info = new OSMTileFactoryInfo();
+        // OSM standard tiles.
+        //
+        // Two things must be right or every tile fetch fails silently
+        // and the map shows only the JXMapViewer "no tiles loaded"
+        // clock-glyph placeholders (exactly what Marty saw at 2026-07-27
+        // 13:48 UTC):
+        //   1. HTTPS. The no-arg OSMTileFactoryInfo() ctor uses
+        //      http://tile.openstreetmap.org which OSM blocks. We pass
+        //      the https base URL to the (name, baseUrl) overload.
+        //   2. A real User-Agent header. OSM's tile-usage policy blocks
+        //      the Java default 'Java/17.x.x'.
+        //      AbstractTileFactory.setUserAgent() flows into every HTTP
+        //      request.
+        //
+        // Ref: https://operations.osmfoundation.org/policies/tiles/
+        //
+        // If a corporate/private tile server is swapped in later, both
+        // knobs move together (baseUrl + user-agent).
+        TileFactoryInfo info = new OSMTileFactoryInfo(
+                "OpenStreetMap", "https://tile.openstreetmap.org");
         DefaultTileFactory tf = new DefaultTileFactory(info);
         tf.setThreadPoolSize(8);
+        tf.setUserAgent("ads-b-rcvr/0.2 (+https://github.com/mdudel/ads-b-rcvr)");
         map.setTileFactory(tf);
 
         // Wire the standard JXMapViewer mouse controls (pan by drag, zoom by
@@ -73,7 +91,9 @@ public final class MapPanel extends JPanel {
         map.addMouseWheelListener(new ZoomMouseWheelListenerCursor(map));
 
         // Sensible default: zoom out enough to see a continent, centre on
-        // Frankfurt (arbitrary but non-zero \u2014 the operator will pan).
+        // Frankfurt. The first positioned snapshot re-centres on the mean
+        // of currently-positioned tracks so the operator sees their live
+        // traffic without having to pan.
         map.setZoom(6);
         map.setAddressLocation(new GeoPosition(50.0, 9.0));
 
@@ -92,7 +112,17 @@ public final class MapPanel extends JPanel {
         repaintCoalescer.setRepeats(true);
         repaintCoalescer.start();
 
-        store.addListener(snap -> repaintPending = true);
+        store.addListener(snap -> {
+            repaintPending = true;
+            // Auto-fit on the FIRST positioned snapshot only. After that
+            // we leave the operator's chosen view alone; otherwise every
+            // new frame would yank the map away from whatever they had
+            // panned or zoomed to.
+            if (!hasAutoFit && snap.hasPosition()) {
+                hasAutoFit = true;
+                SwingUtilities.invokeLater(() -> fitToTracks(11));
+            }
+        });
     }
 
     /** Centre the map on the given aircraft snapshot (used by the table row-click). */
@@ -100,6 +130,27 @@ public final class MapPanel extends JPanel {
         if (t == null || !t.hasPosition()) return;
         SwingUtilities.invokeLater(() ->
                 map.setAddressLocation(new GeoPosition(t.latitude(), t.longitude())));
+    }
+
+    /**
+     * Re-centre + set zoom so the map roughly encompasses every
+     * currently-positioned track. Rough on purpose: we snap to a fixed
+     * zoom and centre on the mean position, rather than solving the
+     * tight-fit bounding problem -- the operator will fine-tune with
+     * mouse wheel and pan.
+     */
+    private void fitToTracks(int zoom) {
+        double sumLat = 0, sumLon = 0;
+        int n = 0;
+        for (AdsbTrack t : store.allSnapshots()) {
+            if (!t.hasPosition()) continue;
+            sumLat += t.latitude();
+            sumLon += t.longitude();
+            n++;
+        }
+        if (n == 0) return;
+        map.setZoom(zoom);
+        map.setAddressLocation(new GeoPosition(sumLat / n, sumLon / n));
     }
 
     /** Painter that reads the store on demand and draws every positioned aircraft. */
@@ -151,8 +202,9 @@ public final class MapPanel extends JPanel {
     // ------------------------------------------------------------------
 
     /**
-     * Draw a filled triangle pointing towards {@code headingDeg} (0\u00b0 = north,
-     * clockwise), 14 px tall, centred on {@code (cx, cy)}.
+     * Draw a filled triangle pointing towards {@code headingDeg}
+     * (0 deg = north, clockwise), 14 px tall, centred on
+     * {@code (cx, cy)}.
      */
     private static void drawAircraftGlyph(Graphics2D g, int cx, int cy,
                                            double headingDeg, Color fill) {
@@ -176,18 +228,18 @@ public final class MapPanel extends JPanel {
     }
 
     /**
-     * Colour band by altitude. Nothing scientific \u2014 just a visual cue:
+     * Colour band by altitude. Nothing scientific -- just a visual cue:
      * low aircraft (arriving/departing) tend to be more interesting to
      * an operator watching a specific field, high aircraft (cruising)
      * fade back.
      */
     private static Color altitudeColour(int altFt) {
         if (altFt == Integer.MIN_VALUE) return Color.LIGHT_GRAY;
-        if (altFt <   5000) return new Color(0xC0, 0x39, 0x2B);   // red   \u2014 low
+        if (altFt <   5000) return new Color(0xC0, 0x39, 0x2B);   // red    - low
         if (altFt <  10000) return new Color(0xE6, 0x7E, 0x22);   // orange
         if (altFt <  20000) return new Color(0xF1, 0xC4, 0x0F);   // amber
         if (altFt <  30000) return new Color(0x27, 0xAE, 0x60);   // green
         if (altFt <  40000) return new Color(0x29, 0x80, 0xB9);   // blue
-        return                     new Color(0x8E, 0x44, 0xAD);   // purple \u2014 high cruise
+        return                     new Color(0x8E, 0x44, 0xAD);   // purple - high cruise
     }
 }

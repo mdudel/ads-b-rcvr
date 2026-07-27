@@ -20,14 +20,14 @@ import java.util.function.Consumer;
 /**
  * Tracks tab: a scrollable {@link JTable} of every aircraft currently
  * held by the {@link AircraftStateStore}. Columns: ICAO, callsign,
- * altitude (ft), speed (kt), heading (\u00b0), age (s since last-seen).
+ * lat, lon, altitude (ft), speed (kt), heading (deg), age (s since last-seen).
  *
- * <p>Selecting a row invokes an optional {@link Consumer} \u2014 the shell
+ * <p>Selecting a row invokes an optional {@link Consumer} -- the shell
  * wires this to {@link MapPanel#centerOn(AdsbTrack)}.
  *
  * <p>Refresh strategy: the model rebuilds its row list from the store
  * on a fixed 500 ms coalescing timer. Simpler than diff-based row
- * updates, cheap for the expected size (< 200 aircraft in view).
+ * updates, cheap for the expected size (&lt; 200 aircraft in view).
  */
 public final class TracksPanel extends JPanel {
 
@@ -73,10 +73,16 @@ public final class TracksPanel extends JPanel {
     // ------------------------------------------------------------------
 
     private static final class Model extends AbstractTableModel {
-        private static final String[] COLS =
-                {"ICAO", "Callsign", "Alt (ft)", "Speed (kt)", "Track (\u00b0)", "Age (s)"};
-        private static final Class<?>[] TYPES =
-                {String.class, String.class, Integer.class, Integer.class, Integer.class, Long.class};
+        // Column layout is hand-kept in sync between COLS, TYPES, and
+        // the switch in getValueAt. Add a column: update all three.
+        private static final String[] COLS = {
+                "ICAO", "Callsign", "Lat", "Lon",
+                "Alt (ft)", "Speed (kt)", "Track", "Age (s)"
+        };
+        private static final Class<?>[] TYPES = {
+                String.class, String.class, Double.class, Double.class,
+                Integer.class, Integer.class, Integer.class, Long.class
+        };
 
         private List<AdsbTrack> rows = new ArrayList<>();
 
@@ -103,19 +109,34 @@ public final class TracksPanel extends JPanel {
                     return (t.callsign() != null && !t.callsign().isBlank())
                             ? t.callsign().trim() : "";
                 case 2:
+                    // Lat as Double so the JTable's default sort is numeric,
+                    // not lexicographic. Rounded to 4 decimal places -- narrow
+                    // column while preserving ~11 m at the equator.
+                    return t.hasPosition()
+                            ? Double.valueOf(round4(t.latitude())) : null;
+                case 3:
+                    return t.hasPosition()
+                            ? Double.valueOf(round4(t.longitude())) : null;
+                case 4:
                     return (t.preferredAltFt() != Integer.MIN_VALUE)
                             ? Integer.valueOf(t.preferredAltFt()) : null;
-                case 3:
+                case 5:
                     return Double.isNaN(t.groundSpeedKts())
                             ? null : Integer.valueOf((int) Math.round(t.groundSpeedKts()));
-                case 4:
+                case 6:
                     return Double.isNaN(t.trackDeg())
                             ? null : Integer.valueOf((int) Math.round(t.trackDeg()));
-                case 5:
+                case 7:
                     return Long.valueOf(
                             Duration.between(t.lastSeen(), Instant.now()).getSeconds());
                 default: return null;
             }
+        }
+
+        /** Round to 4 dp (~11 m). Doubles carry through the JTable's
+         *  own renderer, which respects the JVM locale for display. */
+        private static double round4(double v) {
+            return Math.round(v * 10_000.0) / 10_000.0;
         }
     }
 }
