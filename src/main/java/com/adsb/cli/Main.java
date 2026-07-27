@@ -106,24 +106,10 @@ public class Main {
             });
         }
 
-        // CoT-mode users need to set --rx-latlon so the CPR decoder can
-        // pick the correct zone. Without it, position frames are skipped
-        // and only ident/velocity will surface, so the map picture is
-        // callsigns-only. Warn loudly.
-        if (cfg.payload == PayloadFormat.COT
-                && (Double.isNaN(cfg.rxLat) || Double.isNaN(cfg.rxLon))) {
-            System.err.println("[WARN] --payload cot without --rx-latlon: "
-                    + "CPR position frames will be SKIPPED (would otherwise "
-                    + "produce aliased garbage lat/lon). Set --rx-latlon <lat,lon> "
-                    + "to your receiver's WGS-84 position (a few decimal-degrees is "
-                    + "enough; within ~180 nm of the aircraft is what matters).");
-        }
-
         // Start receiver — blocks until process dies or SIGINT
         AdsbReceiver receiver = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
                 cfg.verbose, cfg.rtlPath,
-                cfg.payload, stateStore, cotBuilder,
-                cfg.rxLat, cfg.rxLon);
+                cfg.payload, stateStore, cotBuilder);
         receiver.start(forwarders);
     }
 
@@ -180,18 +166,14 @@ public class Main {
                 case "--cot-stale-ground":
                     cfg.cotStaleGroundSeconds = Integer.parseInt(args[++i]);
                     break;
-                case "--rx-latlon": {
-                    String[] parts = args[++i].split(",");
-                    if (parts.length != 2)
-                        throw new IllegalArgumentException(
-                                "--rx-latlon: expected <lat,lon>, got '" + args[i] + "'");
-                    cfg.rxLat = Double.parseDouble(parts[0].trim());
-                    cfg.rxLon = Double.parseDouble(parts[1].trim());
-                    if (Math.abs(cfg.rxLat) > 90 || Math.abs(cfg.rxLon) > 180)
-                        throw new IllegalArgumentException(
-                                "--rx-latlon: out of range (lat ±90, lon ±180)");
+                case "--rx-latlon":
+                    // Legacy flag from an earlier CoT commit. The OpenSky-backed
+                    // decoder does global (no-reference) CPR decoding, so a
+                    // receiver position is no longer needed. Silently consume
+                    // the value to keep old command lines working.
+                    i++; // consume the value
+                    System.err.println("[INFO] --rx-latlon is no longer required and is ignored.");
                     break;
-                }
                 case "-h": case "--help":
                     printUsage();
                     System.exit(0);
@@ -244,11 +226,6 @@ public class Main {
                                           Default: civilian
               --cot-stale-air <seconds>   Stale offset for airborne tracks (default 30)
               --cot-stale-ground <seconds>  Stale offset for on-ground tracks (default 120)
-              --rx-latlon <lat,lon>       Receiver WGS-84 position (REQUIRED for
-                                          positions in CoT mode). Without this,
-                                          CPR position frames are skipped and
-                                          only callsign+velocity reach the map.
-                                          Example: --rx-latlon 50.04277,8.32778
 
             RTL-SDR options:
               --rtl-device <index>        Device index (default: 0)
@@ -298,8 +275,6 @@ public class Main {
         Category    cotCategory    = null;   // null -> classifier default (civilian)
         int cotStaleAirSeconds     = 30;
         int cotStaleGroundSeconds  = 120;
-        double rxLat = Double.NaN;
-        double rxLon = Double.NaN;
 
         boolean hasAnyForwarder() {
             return udpHost != null || multicastGroup != null || tcpPort > 0;
