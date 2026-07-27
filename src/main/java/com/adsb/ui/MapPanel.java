@@ -4,7 +4,6 @@ import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
 
 import org.jxmapviewer.JXMapViewer;
-import org.jxmapviewer.OSMTileFactoryInfo;
 import org.jxmapviewer.input.CenterMapListener;
 import org.jxmapviewer.input.PanMouseInputListener;
 import org.jxmapviewer.input.ZoomMouseWheelListenerCursor;
@@ -29,21 +28,37 @@ import java.awt.geom.Point2D;
 import java.util.List;
 
 /**
- * The always-visible map surface. Wraps a {@link JXMapViewer} with
- * an OSM tile source and a custom painter that draws every currently-
- * known aircraft as a heading-rotated glyph coloured by altitude band.
+ * The always-visible map surface. Wraps a {@link JXMapViewer} with an
+ * OSM tile source and a custom painter that draws every currently-known
+ * aircraft as a heading-rotated glyph coloured by altitude band.
  *
- * <p>The painter reads the latest snapshot list from
- * {@link AircraftStateStore#allSnapshots()} on every repaint, so the
- * map picture always matches the store even if updates arrive faster
- * than the painter can keep up.
+ * <p><b>TileFactoryInfo shape</b> is lifted verbatim from
+ * {@code tmsweb3190/client/map/JXMapProvider} (Marty 2026-07-27 13:52
+ * UTC direction "look at the map in TMSWEB client, that code works").
+ * Key details that must not be tweaked without understanding what they
+ * do:
+ * <ul>
+ *   <li>{@code totalMapZoom = 17}. JXMapViewer stores zoom as
+ *       "distance from totalMapZoom" (0 = closest, totalMapZoom = world).
+ *       {@link TileFactoryInfo#getTileUrl(int, int, int)} inverts back
+ *       via {@code z = totalMapZoom - zoom} to get the OSM Z number.</li>
+ *   <li>{@code xr2l = true, yt2b = true}. OSM serves XYZ tiles with X
+ *       increasing east and Y increasing SOUTH. The stock
+ *       {@code OSMTileFactoryInfo} in JXMapViewer 2.8 also sets both
+ *       true, but ships {@code totalMapZoom = 19} which would silently
+ *       fetch tiles at a different Z than the operator asked for.</li>
+ *   <li>Anonymous subclass overrides {@code getTileUrl} so the base URL
+ *       is read on every fetch (matches tmsweb-client so a future
+ *       corporate-tile-server toggle would be a one-liner).</li>
+ * </ul>
  *
  * <p>Repaint cadence: state-store updates trigger a coalesced repaint
  * via a 250 ms {@link Timer} (four frames per second is enough for
- * ADS-B tracks; painting on every update would spin the EDT with
- * ~40 aircraft x 2 Hz = 80 repaints/second).
+ * ADS-B tracks).
  */
 public final class MapPanel extends JPanel {
+
+    private static final String OSM_BASE_URL = "https://tile.openstreetmap.org";
 
     private final JXMapViewer map;
     private final AircraftStateStore store;
@@ -57,44 +72,44 @@ public final class MapPanel extends JPanel {
 
         this.map = new JXMapViewer();
 
-        // OSM standard tiles.
-        //
-        // Two things must be right or every tile fetch fails silently
-        // and the map shows only the JXMapViewer "no tiles loaded"
-        // clock-glyph placeholders (exactly what Marty saw at 2026-07-27
-        // 13:48 UTC):
-        //   1. HTTPS. The no-arg OSMTileFactoryInfo() ctor uses
-        //      http://tile.openstreetmap.org which OSM blocks. We pass
-        //      the https base URL to the (name, baseUrl) overload.
-        //   2. A real User-Agent header. OSM's tile-usage policy blocks
-        //      the Java default 'Java/17.x.x'.
-        //      AbstractTileFactory.setUserAgent() flows into every HTTP
-        //      request.
-        //
-        // Ref: https://operations.osmfoundation.org/policies/tiles/
-        //
-        // If a corporate/private tile server is swapped in later, both
-        // knobs move together (baseUrl + user-agent).
-        TileFactoryInfo info = new OSMTileFactoryInfo(
-                "OpenStreetMap", "https://tile.openstreetmap.org");
+        // Custom TileFactoryInfo. See class javadoc for why we don't
+        // use OSMTileFactoryInfo directly.
+        TileFactoryInfo info = new TileFactoryInfo(
+                /*minZoom*/  0,
+                /*maxZoom*/  17,
+                /*totalZoom*/17,
+                /*tileSize*/ 256,
+                /*xr2l*/     true,
+                /*yt2b*/     true,
+                /*baseURL*/  OSM_BASE_URL,
+                "x", "y", "z") {
+            @Override
+            public String getTileUrl(int x, int y, int zoom) {
+                // JXMapViewer passes its internal zoom (0..totalMapZoom
+                // where 0 = closest). Invert to the OSM Z number.
+                int z = getTotalMapZoom() - zoom;
+                return OSM_BASE_URL + "/" + z + "/" + x + "/" + y + ".png";
+            }
+        };
         DefaultTileFactory tf = new DefaultTileFactory(info);
         tf.setThreadPoolSize(8);
-        tf.setUserAgent("ads-b-rcvr/0.2 (+https://github.com/mdudel/ads-b-rcvr)");
         map.setTileFactory(tf);
 
-        // Wire the standard JXMapViewer mouse controls (pan by drag, zoom by
-        // wheel, double-click centres).
+        // Standard interactive controls.
         var pan = new PanMouseInputListener(map);
         map.addMouseListener(pan);
         map.addMouseMotionListener(pan);
         map.addMouseListener(new CenterMapListener(map));
         map.addMouseWheelListener(new ZoomMouseWheelListenerCursor(map));
 
-        // Sensible default: zoom out enough to see a continent, centre on
-        // Frankfurt. The first positioned snapshot re-centres on the mean
-        // of currently-positioned tracks so the operator sees their live
-        // traffic without having to pan.
-        map.setZoom(6);
+        // Sensible default view: Frankfurt-ish, ~continent scale. The
+        // first positioned snapshot re-centres on live traffic so the
+        // operator sees their aircraft without having to pan.
+        //
+        // Zoom is expressed as "distance from totalMapZoom" per JXMapViewer
+        // convention, so viewer-zoom 11 corresponds to OSM Z = 17 - 11 = 6
+        // (roughly continent scale).
+        map.setZoom(11);
         map.setAddressLocation(new GeoPosition(50.0, 9.0));
 
         map.setOverlayPainter(new AircraftPainter());
@@ -114,13 +129,10 @@ public final class MapPanel extends JPanel {
 
         store.addListener(snap -> {
             repaintPending = true;
-            // Auto-fit on the FIRST positioned snapshot only. After that
-            // we leave the operator's chosen view alone; otherwise every
-            // new frame would yank the map away from whatever they had
-            // panned or zoomed to.
+            // Auto-fit on the FIRST positioned snapshot only.
             if (!hasAutoFit && snap.hasPosition()) {
                 hasAutoFit = true;
-                SwingUtilities.invokeLater(() -> fitToTracks(11));
+                SwingUtilities.invokeLater(this::fitToTracks);
             }
         });
     }
@@ -134,12 +146,11 @@ public final class MapPanel extends JPanel {
 
     /**
      * Re-centre + set zoom so the map roughly encompasses every
-     * currently-positioned track. Rough on purpose: we snap to a fixed
-     * zoom and centre on the mean position, rather than solving the
-     * tight-fit bounding problem -- the operator will fine-tune with
-     * mouse wheel and pan.
+     * currently-positioned track. Rough on purpose -- snap to a fixed
+     * viewer-zoom (7, i.e. OSM Z=10, ~regional) and centre on the mean
+     * position. The operator fine-tunes with mouse wheel and pan.
      */
-    private void fitToTracks(int zoom) {
+    private void fitToTracks() {
         double sumLat = 0, sumLon = 0;
         int n = 0;
         for (AdsbTrack t : store.allSnapshots()) {
@@ -149,7 +160,9 @@ public final class MapPanel extends JPanel {
             n++;
         }
         if (n == 0) return;
-        map.setZoom(zoom);
+        // viewer-zoom 7 = OSM Z 10 (~150 nm across at mid-latitudes),
+        // matches what a stationary ADS-B receiver can see.
+        map.setZoom(7);
         map.setAddressLocation(new GeoPosition(sumLat / n, sumLon / n));
     }
 
