@@ -2,9 +2,30 @@
 
 Receives ADS-B Mode S frames from an RTL-SDR dongle via `rtl_adsb.exe` and
 forwards them over **UDP unicast**, **UDP multicast**, or **TCP**.
-All three transports can run simultaneously.
+All three transports can run simultaneously, in any mix of payload formats,
+managed either via CLI flags or the built-in **Swing UI**.
 
-**Payload format is selectable** via `--payload`:
+## Quick start with the UI
+
+```cmd
+run.bat --ui
+```
+
+Opens a window with:
+- **Map** in the centre — aircraft glyphs rotated by heading, coloured by altitude
+- **Toolbar** on top (Tracks / Connectors / Settings / About) each opening a side dock
+- **Tracks** — sortable table of every aircraft; click a row to centre the map
+- **Connectors** — add / edit / remove / enable-toggle any number of
+  UDP unicast / multicast / TCP output sinks, each with its own payload
+  (avr / json / cot). Zenoh is present in the type list but disabled
+  until issue #4 lands.
+- **Settings** — CoT affiliation / category / stale timeouts, live-editable
+
+Connectors persist to `~/.adsb-rcvr/adsb-rcvr.properties` on every change,
+so the next run reopens the same set.
+
+**Payload format** is selectable per-connector in the UI, or globally on
+the CLI via `--payload`:
 
 | Value | Wire content | Downstream consumers |
 |-------|--------------|----------------------|

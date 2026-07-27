@@ -98,6 +98,16 @@ public final class AircraftStateStore {
     }
 
     /**
+     * @return snapshot list of every track currently held, in no
+     *         particular order. The returned list is a fresh
+     *         {@link java.util.ArrayList}; callers may sort/filter it
+     *         without disturbing the store.
+     */
+    public java.util.List<AdsbTrack> allSnapshots() {
+        return new java.util.ArrayList<>(tracks.values());
+    }
+
+    /**
      * Drop tracks whose {@code lastSeen} is older than {@code now - maxAge}.
      * Intended for periodic housekeeping; safe to call while updates are
      * flowing in on other threads.

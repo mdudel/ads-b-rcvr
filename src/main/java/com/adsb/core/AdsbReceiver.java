@@ -2,7 +2,6 @@ package com.adsb.core;
 
 import com.adsb.cot.CoTBuilder;
 import com.adsb.model.AdsbFrame;
-import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.model.TrackMerger;
 
@@ -14,6 +13,24 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Owns the {@code rtl_adsb} subprocess and the per-frame dispatch loop.
+ * Sinks (UDP/multicast/TCP/etc) are pulled from a {@link SinkRegistry}
+ * so the UI can attach/detach connectors at runtime without
+ * restarting the receiver.
+ *
+ * <p><b>Payload dispatch:</b> each frame may be materialised in up to
+ * three shapes (AVR / JSON / CoT). Each shape is computed only if at
+ * least one registered sink wants it (see
+ * {@link SinkRegistry#anyWants(PayloadFormat)}), so a receiver with
+ * only AVR sinks pays nothing for JSON parse work.
+ *
+ * <p>CoT is a special case: it is not emitted per-frame from the
+ * dispatch loop. Instead, {@code CoTForwarder} (wired by the caller
+ * to be a {@link AircraftStateStore} listener) emits one CoT
+ * document per aggregated snapshot update. This class only touches
+ * the state store when at least one CoT sink is registered.
+ */
 public class AdsbReceiver {
 
     private static final boolean IS_WINDOWS =
@@ -24,43 +41,71 @@ public class AdsbReceiver {
     private final String  format;
     private final boolean verbose;
     private final String  rtlPath;
-    private final PayloadFormat  payload;
     private final AircraftStateStore stateStore;
     private final CoTBuilder     cotBuilder;
+    private final SinkRegistry   sinks;
 
+    /**
+     * @param stateStore may be null when the receiver is only serving
+     *                   stateless AVR/JSON sinks
+     * @param cotBuilder may be null when no CoT sink is envisaged; only
+     *                   consulted by whichever caller wires the CoT
+     *                   state-store listener
+     * @param sinks      the live sink set; iterate per frame and
+     *                   dispatch. Never null.
+     */
     public AdsbReceiver(int deviceIndex, String gain, String format,
                         boolean verbose, String rtlPath,
-                        PayloadFormat payload,
                         AircraftStateStore stateStore,
-                        CoTBuilder cotBuilder) {
+                        CoTBuilder cotBuilder,
+                        SinkRegistry sinks) {
         this.deviceIndex = deviceIndex;
         this.gain        = gain;
         this.format      = format;
         this.verbose     = verbose;
         this.rtlPath     = rtlPath;
-        this.payload     = payload == null ? PayloadFormat.JSON : payload;
         this.stateStore  = stateStore;
         this.cotBuilder  = cotBuilder;
+        this.sinks       = sinks == null ? new SinkRegistry() : sinks;
     }
 
     /**
-     * Back-compat overload used by tests / callers that predate the
-     * {@code --payload} flag. Defaults to {@link PayloadFormat#JSON} to
-     * preserve historical output.
+     * Legacy back-compat constructor: no state store, no CoT, no sinks
+     * (empty registry). Retained so any external caller that used the
+     * pre-connector API still compiles; production has moved on.
      */
     public AdsbReceiver(int deviceIndex, String gain, String format,
                         boolean verbose, String rtlPath) {
         this(deviceIndex, gain, format, verbose, rtlPath,
-             PayloadFormat.JSON, null, null);
+             null, null, new SinkRegistry());
     }
 
-    public void start(List<? extends AutoCloseable> forwarders) throws Exception {
+    public SinkRegistry sinks() { return sinks; }
+
+    /**
+     * Old {@code start(List<AutoCloseable>)} contract kept for
+     * pre-connector callers (like the earlier smoke tests). Each item
+     * is registered into the SinkRegistry as an AVR-payload sink
+     * (matching legacy behaviour of "put raw frames on the wire").
+     */
+    public void start(List<? extends AutoCloseable> legacyForwarders) throws Exception {
+        int i = 0;
+        for (AutoCloseable ac : legacyForwarders) {
+            if (ac instanceof FrameForwarder ff) {
+                sinks.add("legacy-" + (i++), PayloadFormat.JSON, ff);
+            }
+        }
+        start();
+    }
+
+    /** Modern start: sinks come from the {@link SinkRegistry}, mutated live. */
+    public void start() throws Exception {
         ProcessBuilder pb = buildProcess();
         pb.redirectErrorStream(false);
         System.out.println("[INFO] Starting: " + String.join(" ", pb.command()));
         Process proc = pb.start();
 
-        // Drain stderr in a background daemon thread to prevent pipe blocking
+        // Drain stderr in a background daemon thread to prevent pipe blocking.
         Thread stderrDrainer = new Thread(() -> {
             try (BufferedReader err = new BufferedReader(
                     new InputStreamReader(proc.getErrorStream(), Charset.defaultCharset()))) {
@@ -73,7 +118,6 @@ public class AdsbReceiver {
         stderrDrainer.setDaemon(true);
         stderrDrainer.start();
 
-        // Read AVR frames from stdout, decode to JSON, forward
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(proc.getInputStream(), Charset.defaultCharset()))) {
 
@@ -83,54 +127,45 @@ public class AdsbReceiver {
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty()) continue;
+                frameCount++;
 
-                // Merge the typed frame into the state store; this drives the
-                // CoT emission path via a listener, decoupled from the
-                // per-line forwarding loop below.
+                // Feed the state store whenever a CoT sink or the UI is
+                // interested (both subscribe via AircraftStateStore listeners).
                 if (stateStore != null) {
                     AdsbFrame typed = AdsbDecoder.decodeTyped(line);
                     if (typed != null) TrackMerger.merge(stateStore, typed);
                 }
 
-                // Select on-the-wire bytes based on --payload:
-                //   AVR  -> the raw hex line as received
-                //   JSON -> decoder output (historical default)
-                //   COT  -> handled elsewhere (listener on the state store);
-                //           for the per-frame forwarding loop we emit nothing.
-                byte[] frame;
-                String printable;
-                switch (payload) {
-                    case AVR -> {
-                        printable = line;
-                        frame     = (line + "\n").getBytes(StandardCharsets.UTF_8);
-                    }
-                    case JSON -> {
-                        String json = AdsbDecoder.decode(line);
-                        if (json == null) continue;
-                        printable = json;
-                        frame     = (json + "\n").getBytes(StandardCharsets.UTF_8);
-                    }
-                    case COT -> {
-                        // CoT flows through the state-store listener; skip
-                        // the per-frame loop entirely for COT.
-                        if (verbose) System.out.printf("[FRAME %06d] %s%n", ++frameCount, line);
-                        continue;
-                    }
-                    default -> throw new IllegalStateException("unreachable");
+                // Compute each payload shape lazily \u2014 only if some sink wants it.
+                byte[] avrBytes  = null;
+                byte[] jsonBytes = null;
+                boolean anyAvr  = sinks.anyWants(PayloadFormat.AVR);
+                boolean anyJson = sinks.anyWants(PayloadFormat.JSON);
+
+                if (anyAvr) {
+                    avrBytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
+                }
+                if (anyJson) {
+                    String json = AdsbDecoder.decode(line);
+                    if (json != null) jsonBytes = (json + "\n").getBytes(StandardCharsets.UTF_8);
                 }
 
                 if (verbose) {
-                    System.out.printf("[FRAME %06d] %s%n", ++frameCount, printable);
+                    System.out.printf("[FRAME %06d] %s%n", frameCount, line);
                 }
 
-                for (AutoCloseable fwd : forwarders) {
-                    if (fwd instanceof FrameForwarder ff) {
-                        try {
-                            ff.forward(frame);
-                        } catch (Exception e) {
-                            System.err.println("[WARN] Forward error ("
-                                    + fwd.getClass().getSimpleName() + "): " + e.getMessage());
-                        }
+                for (SinkRegistry.AttachedSink s : sinks.snapshot()) {
+                    byte[] payloadBytes = switch (s.payload()) {
+                        case AVR  -> avrBytes;
+                        case JSON -> jsonBytes;
+                        case COT  -> null;       // CoT flows via the state-store listener
+                    };
+                    if (payloadBytes == null) continue;
+                    try {
+                        s.forwarder().forward(payloadBytes);
+                    } catch (Exception e) {
+                        System.err.println("[WARN] Forward error on sink " + s.id()
+                                + " (" + s.payload() + "): " + e.getMessage());
                     }
                 }
             }
