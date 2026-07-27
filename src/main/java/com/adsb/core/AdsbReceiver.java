@@ -187,4 +187,49 @@ public class AdsbReceiver {
         pb.environment().putAll(System.getenv());
         return pb;
     }
+
+    /**
+     * Pre-flight: confirm the {@code rtl_adsb} executable exists at the
+     * expected location before we open the UI or attach any connectors.
+     *
+     * <p>Resolution rules:
+     * <ol>
+     *   <li>If {@code rtlPath} is set (from {@code --rtl-path}), require
+     *       the executable at exactly that folder.</li>
+     *   <li>Otherwise, require it in the current working directory (i.e.
+     *       the folder the receiver was launched from). This matches the
+     *       shipped {@code run.bat} convention on Windows where
+     *       {@code rtl_adsb.exe} and the DLLs sit next to the jar.</li>
+     * </ol>
+     *
+     * <p>{@link System#getenv("PATH")} is deliberately NOT consulted —
+     * per Marty's 2026-07-27 direction, the receiver looks in the local
+     * directory, not the wider PATH. Users who install {@code rtl_adsb}
+     * system-wide should still pass {@code --rtl-path} to be explicit.
+     *
+     * @param rtlPath value of the {@code --rtl-path} CLI flag, or null
+     *                to check the current working directory instead.
+     * @return the resolved absolute {@link java.io.File} for the executable
+     * @throws java.io.FileNotFoundException with a user-facing message if
+     *         the executable is not present at the expected location.
+     */
+    public static java.io.File requireRtlAdsbExecutable(String rtlPath) throws java.io.FileNotFoundException {
+        String exeName = IS_WINDOWS ? "rtl_adsb.exe" : "rtl_adsb";
+        java.io.File dir = (rtlPath != null && !rtlPath.isBlank())
+                ? new java.io.File(rtlPath)
+                : new java.io.File(".").getAbsoluteFile();
+        java.io.File exe = new java.io.File(dir, exeName);
+        if (!exe.isFile()) {
+            String source = (rtlPath != null && !rtlPath.isBlank())
+                    ? "--rtl-path folder"
+                    : "current directory";
+            throw new java.io.FileNotFoundException(
+                    "[ERROR] " + exeName + " not found in " + source + " ("
+                            + dir.getAbsolutePath() + ").\n"
+                            + "        Either drop " + exeName + " (plus its DLLs) into the launch folder,\n"
+                            + "        or pass --rtl-path <dir> pointing at the folder that contains it.\n"
+                            + "        Download: https://github.com/rtlsdrblog/rtl-sdr-blog/releases");
+        }
+        return exe;
+    }
 }

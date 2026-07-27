@@ -47,6 +47,17 @@ public class Main {
 
         System.out.printf("[INFO] ADS-B Receiver %s%n", VERSION);
 
+        // Fail fast if the RTL-SDR executable isn't where we expect it.
+        // Rule (Marty 2026-07-27 13:30 UTC): when --rtl-path isn't set,
+        // look in the current working directory. Do NOT walk PATH.
+        try {
+            java.io.File exe = AdsbReceiver.requireRtlAdsbExecutable(cfg.rtlPath);
+            System.out.printf("[INFO] Using rtl_adsb: %s%n", exe.getAbsolutePath());
+        } catch (java.io.FileNotFoundException e) {
+            System.err.println(e.getMessage());
+            System.exit(2);
+        }
+
         // Shared plumbing: state store + sink registry + live CoT builder.
         AircraftStateStore stateStore = new AircraftStateStore();
         SinkRegistry sinks = new SinkRegistry();
