@@ -58,6 +58,19 @@
             <version>2.8</version>
         </dependency>
 
+        <!--
+            FlatLaf for the light + dark Swing look-and-feel. Same
+            library tmsweb-client uses; ~1.5 MB, Apache-2.0. Adds a
+            clean modern chrome (flat borders, subtle shadows, native
+            HiDPI) instead of the 1998-era Metal L&F Swing ships with
+            by default. Two base themes: FlatLightLaf, FlatDarkLaf.
+        -->
+        <dependency>
+            <groupId>com.formdev</groupId>
+            <artifactId>flatlaf</artifactId>
+            <version>3.4</version>
+        </dependency>
+
         <!-- Test -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>

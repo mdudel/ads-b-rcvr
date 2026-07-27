@@ -9,6 +9,7 @@ import com.adsb.cot.IcaoAircraftClassifier.Affiliation;
 import com.adsb.cot.IcaoAircraftClassifier.Category;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.ui.MainFrame;
+import com.adsb.ui.ThemeMode;
 import com.adsb.ui.model.Connector;
 import com.adsb.ui.model.ConnectorAttacher;
 import com.adsb.ui.model.ConnectorStore;
@@ -77,6 +78,14 @@ public class Main {
             System.err.println("[WARN] Failed to load " + storePath + ": " + e);
         }
 
+        // Theme lives in the same properties file under ui.themeMode.
+        // Apply it BEFORE we open any window so the first-paint chrome
+        // is already correct — no fatal FlatLaf-loading flicker.
+        ThemeMode initialTheme = readThemeMode(storePath);
+        if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
+            initialTheme.apply();
+        }
+
         ConnectorAttacher attacher = new ConnectorAttacher(sinks, stateStore, liveBuilder);
 
         // Turn CLI sink flags into transient in-memory connectors so they
@@ -113,7 +122,9 @@ public class Main {
                     MainFrame frame = new MainFrame(VERSION,
                             stateStore, connectorStore, attacher, liveBuilder,
                             cfg.cotAffiliation, cfg.cotCategory,
-                            cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds);
+                            cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds,
+                            initialTheme,
+                            newTheme -> writeThemeMode(storePath, newTheme));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     frame.setVisible(true);
                 });
@@ -147,6 +158,58 @@ public class Main {
 
         // Start receiver -- blocks on the rtl_adsb stdout stream.
         receiver.start();
+    }
+
+    /**
+     * Read {@code ui.themeMode} from the shared properties file if it
+     * exists; return {@link ThemeMode#LIGHT} if the file is missing,
+     * unreadable, or the key isn't set. Shares the file with
+     * {@link ConnectorStore}; keeping a single properties file for all
+     * UI persistence beats introducing a separate config layer for one
+     * enum.
+     */
+    private static ThemeMode readThemeMode(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return ThemeMode.LIGHT;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            return ThemeMode.fromString(p.getProperty("ui.themeMode"));
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.themeMode from "
+                    + storePath + ": " + e);
+            return ThemeMode.LIGHT;
+        }
+    }
+
+    /**
+     * Persist {@code ui.themeMode = <canonical>} into the shared
+     * properties file. Preserves every other key (including all the
+     * connector.* entries {@link ConnectorStore} owns) by
+     * load-mutate-store rather than overwriting.
+     */
+    private static void writeThemeMode(Path storePath, ThemeMode mode) {
+        try {
+            java.nio.file.Files.createDirectories(storePath.getParent());
+            java.util.Properties p = new java.util.Properties();
+            if (java.nio.file.Files.exists(storePath)) {
+                try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                    p.load(in);
+                }
+            }
+            p.setProperty("ui.themeMode", mode.canonical());
+            java.nio.file.Path tmp = storePath.resolveSibling(
+                    storePath.getFileName().toString() + ".tmp");
+            try (var out = java.nio.file.Files.newBufferedWriter(tmp)) {
+                p.store(out, "ADS-B receiver settings");
+            }
+            java.nio.file.Files.move(tmp, storePath,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not persist ui.themeMode: " + e);
+        }
     }
 
     private static List<Connector> cliSinksAsConnectors(Config cfg) {

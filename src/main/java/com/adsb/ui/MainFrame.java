@@ -21,6 +21,7 @@ import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 /**
  * Main window. Layout (cribbed from tmsweb3190/client MainFrame):
@@ -64,6 +65,14 @@ public final class MainFrame extends JFrame {
     /** Live CoT builder ref \u2014 rebuilt when the SettingsPanel fires. */
     private final AtomicReference<CoTBuilder> liveBuilder;
 
+    /**
+     * @param initialTheme starting theme; the toolbar cycle button flips
+     *                     it and calls {@code onThemeChanged} so the caller
+     *                     can persist it. May be null (defaults to LIGHT).
+     * @param onThemeChanged called every time the operator cycles the
+     *                     theme; typical impl writes to the config file.
+     *                     Nullable if persistence isn't wired.
+     */
     public MainFrame(String version,
                      AircraftStateStore store,
                      ConnectorStore connectorStore,
@@ -71,7 +80,9 @@ public final class MainFrame extends JFrame {
                      AtomicReference<CoTBuilder> liveBuilder,
                      IcaoAircraftClassifier.Affiliation initialAffil,
                      IcaoAircraftClassifier.Category    initialCat,
-                     int initialStaleAir, int initialStaleGround) {
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -123,6 +134,23 @@ public final class MainFrame extends JFrame {
         addToolbarButton(toolbar, ID_ABOUT,      "About",      "Version + help + links",
                 () -> sideDock.toggle(ID_ABOUT,      "About",      aboutPanel));
 
+        // Theme cycle button, right side. Two-state (LIGHT <-> DARK)
+        // matching Marty's 2026-07-27 14:28 UTC ask. Label reflects
+        // the CURRENT theme so the button reads as "you are here";
+        // clicking flips and updates.
+        final ThemeMode[] currentTheme = { initialTheme == null ? ThemeMode.LIGHT : initialTheme };
+        toolbar.add(javax.swing.Box.createHorizontalGlue());
+        JButton themeBtn = new JButton(themeButtonLabel(currentTheme[0]));
+        themeBtn.setToolTipText("Cycle theme: LIGHT <-> DARK");
+        themeBtn.setFocusable(false);
+        themeBtn.addActionListener(e -> {
+            currentTheme[0] = currentTheme[0].next();
+            currentTheme[0].apply();
+            themeBtn.setText(themeButtonLabel(currentTheme[0]));
+            if (onThemeChanged != null) onThemeChanged.accept(currentTheme[0]);
+        });
+        toolbar.add(themeBtn);
+
         // ----- status bar -----
         JLabel countLabel = new JLabel("tracks: 0");
         JLabel sinkLabel  = new JLabel("sinks: 0");
@@ -161,5 +189,10 @@ public final class MainFrame extends JFrame {
         b.addActionListener(e -> onClick.run());
         toolbarButtons.put(id, b);
         bar.add(b);
+    }
+
+    /** "Theme: Light" / "Theme: Dark" for the top-right cycle button. */
+    private static String themeButtonLabel(ThemeMode m) {
+        return "Theme: " + (m == ThemeMode.DARK ? "Dark" : "Light");
     }
 }

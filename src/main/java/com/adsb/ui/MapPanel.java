@@ -13,48 +13,39 @@ import org.jxmapviewer.viewer.GeoPosition;
 import org.jxmapviewer.viewer.TileFactoryInfo;
 
 import javax.swing.BorderFactory;
+import javax.swing.JLayeredPane;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Component;
+import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
+import java.awt.event.ComponentAdapter;
+import java.awt.event.ComponentEvent;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
 import java.util.List;
 
 /**
- * The always-visible map surface. Wraps a {@link JXMapViewer} with an
- * OSM tile source and a custom painter that draws every currently-known
- * aircraft as a heading-rotated glyph coloured by altitude band.
+ * Map surface + floating nav bezel. Wraps a {@link JXMapViewer} in a
+ * {@link JLayeredPane} so the {@link MapNavPanel} (pan bezel + zoom
+ * column) can float on top of the tiles at the upper-right without
+ * stealing tile real estate.
  *
- * <p><b>TileFactoryInfo shape</b> is lifted verbatim from
- * {@code tmsweb3190/client/map/JXMapProvider} (Marty 2026-07-27 13:52
- * UTC direction "look at the map in TMSWEB client, that code works").
- * Key details that must not be tweaked without understanding what they
- * do:
- * <ul>
- *   <li>{@code totalMapZoom = 17}. JXMapViewer stores zoom as
- *       "distance from totalMapZoom" (0 = closest, totalMapZoom = world).
- *       {@link TileFactoryInfo#getTileUrl(int, int, int)} inverts back
- *       via {@code z = totalMapZoom - zoom} to get the OSM Z number.</li>
- *   <li>{@code xr2l = true, yt2b = true}. OSM serves XYZ tiles with X
- *       increasing east and Y increasing SOUTH. The stock
- *       {@code OSMTileFactoryInfo} in JXMapViewer 2.8 also sets both
- *       true, but ships {@code totalMapZoom = 19} which would silently
- *       fetch tiles at a different Z than the operator asked for.</li>
- *   <li>Anonymous subclass overrides {@code getTileUrl} so the base URL
- *       is read on every fetch (matches tmsweb-client so a future
- *       corporate-tile-server toggle would be a one-liner).</li>
- * </ul>
+ * <p>Layered-pane pattern lifted verbatim from tmsweb-client's
+ * {@code MapPanel.buildMapArea} at Marty's 2026-07-27 14:28 UTC
+ * direction. Same {@code ComponentListener} trick to reposition both
+ * children on resize (JLayeredPane has no automatic layout).
  *
- * <p>Repaint cadence: state-store updates trigger a coalesced repaint
- * via a 250 ms {@link Timer} (four frames per second is enough for
- * ADS-B tracks).
+ * <p><b>TileFactoryInfo shape</b> is unchanged from commit 0255ce1 --
+ * see the class javadoc there for why we don't use
+ * {@code OSMTileFactoryInfo}.
  */
 public final class MapPanel extends JPanel {
 
@@ -72,8 +63,7 @@ public final class MapPanel extends JPanel {
 
         this.map = new JXMapViewer();
 
-        // Custom TileFactoryInfo. See class javadoc for why we don't
-        // use OSMTileFactoryInfo directly.
+        // Custom TileFactoryInfo (see class javadoc + commit 0255ce1).
         TileFactoryInfo info = new TileFactoryInfo(
                 /*minZoom*/  0,
                 /*maxZoom*/  17,
@@ -85,8 +75,6 @@ public final class MapPanel extends JPanel {
                 "x", "y", "z") {
             @Override
             public String getTileUrl(int x, int y, int zoom) {
-                // JXMapViewer passes its internal zoom (0..totalMapZoom
-                // where 0 = closest). Invert to the OSM Z number.
                 int z = getTotalMapZoom() - zoom;
                 return OSM_BASE_URL + "/" + z + "/" + x + "/" + y + ".png";
             }
@@ -95,29 +83,23 @@ public final class MapPanel extends JPanel {
         tf.setThreadPoolSize(8);
         map.setTileFactory(tf);
 
-        // Standard interactive controls.
+        // Standard mouse controls.
         var pan = new PanMouseInputListener(map);
         map.addMouseListener(pan);
         map.addMouseMotionListener(pan);
         map.addMouseListener(new CenterMapListener(map));
         map.addMouseWheelListener(new ZoomMouseWheelListenerCursor(map));
 
-        // Sensible default view: Frankfurt-ish, ~continent scale. The
-        // first positioned snapshot re-centres on live traffic so the
-        // operator sees their aircraft without having to pan.
-        //
-        // Zoom is expressed as "distance from totalMapZoom" per JXMapViewer
-        // convention, so viewer-zoom 11 corresponds to OSM Z = 17 - 11 = 6
-        // (roughly continent scale).
+        // Sensible default view. First positioned snapshot re-centres.
         map.setZoom(11);
         map.setAddressLocation(new GeoPosition(50.0, 9.0));
 
         map.setOverlayPainter(new AircraftPainter());
         setBorder(BorderFactory.createEmptyBorder());
-        add(map, BorderLayout.CENTER);
 
-        // Coalesce: many state-store updates in a burst collapse into one
-        // repaint every 250 ms.
+        // Wrap map + nav in a layered pane. Nav floats upper-right.
+        add(buildMapArea(), BorderLayout.CENTER);
+
         this.repaintCoalescer = new Timer(250, e -> {
             if (repaintPending) {
                 repaintPending = false;
@@ -129,7 +111,6 @@ public final class MapPanel extends JPanel {
 
         store.addListener(snap -> {
             repaintPending = true;
-            // Auto-fit on the FIRST positioned snapshot only.
             if (!hasAutoFit && snap.hasPosition()) {
                 hasAutoFit = true;
                 SwingUtilities.invokeLater(this::fitToTracks);
@@ -137,19 +118,50 @@ public final class MapPanel extends JPanel {
         });
     }
 
-    /** Centre the map on the given aircraft snapshot (used by the table row-click). */
+    /**
+     * Build a {@link JLayeredPane} that stacks:
+     * <ul>
+     *   <li>The map component on {@link JLayeredPane#DEFAULT_LAYER},
+     *       filling the whole area.</li>
+     *   <li>The {@link MapNavPanel} on
+     *       {@link JLayeredPane#PALETTE_LAYER}, anchored upper-right
+     *       with a 12 px inset.</li>
+     * </ul>
+     *
+     * <p>JLayeredPane does NOT auto-layout its children; we install a
+     * {@link ComponentAdapter#componentResized} handler to reposition
+     * both on every resize. Same technique tmsweb-client uses.
+     */
+    private JLayeredPane buildMapArea() {
+        final Component mapComp = map;
+        final MapNavPanel nav = new MapNavPanel(map);
+
+        final JLayeredPane layered = new JLayeredPane();
+        layered.setLayout(null);
+        layered.add(mapComp, JLayeredPane.DEFAULT_LAYER);
+        layered.add(nav,     JLayeredPane.PALETTE_LAYER);
+
+        layered.addComponentListener(new ComponentAdapter() {
+            @Override public void componentResized(ComponentEvent e) {
+                mapComp.setBounds(0, 0, layered.getWidth(), layered.getHeight());
+                Dimension pref = nav.getPreferredSize();
+                int inset = 12;
+                int x = Math.max(inset, layered.getWidth() - pref.width - inset);
+                nav.setBounds(x, inset, pref.width, pref.height);
+                layered.revalidate();
+            }
+        });
+        return layered;
+    }
+
+    /** Centre the map on the given aircraft snapshot. Used by the table row-click. */
     public void centerOn(AdsbTrack t) {
         if (t == null || !t.hasPosition()) return;
         SwingUtilities.invokeLater(() ->
                 map.setAddressLocation(new GeoPosition(t.latitude(), t.longitude())));
     }
 
-    /**
-     * Re-centre + set zoom so the map roughly encompasses every
-     * currently-positioned track. Rough on purpose -- snap to a fixed
-     * viewer-zoom (7, i.e. OSM Z=10, ~regional) and centre on the mean
-     * position. The operator fine-tunes with mouse wheel and pan.
-     */
+    /** Re-centre + zoom to roughly encompass currently-positioned tracks. */
     private void fitToTracks() {
         double sumLat = 0, sumLon = 0;
         int n = 0;
@@ -160,13 +172,12 @@ public final class MapPanel extends JPanel {
             n++;
         }
         if (n == 0) return;
-        // viewer-zoom 7 = OSM Z 10 (~150 nm across at mid-latitudes),
-        // matches what a stationary ADS-B receiver can see.
         map.setZoom(7);
         map.setAddressLocation(new GeoPosition(sumLat / n, sumLon / n));
     }
 
-    /** Painter that reads the store on demand and draws every positioned aircraft. */
+    // ------------------------------------------------------------------
+
     private final class AircraftPainter implements Painter<JXMapViewer> {
         @Override
         public void paint(Graphics2D g, JXMapViewer viewer, int width, int height) {
@@ -179,7 +190,14 @@ public final class MapPanel extends JPanel {
                 Font labelFont = g.getFont().deriveFont(Font.PLAIN, 10f);
                 g.setFont(labelFont);
 
-                for (AdsbTrack t : snapshotList()) {
+                // Label colour follows the current theme so it reads
+                // in both LIGHT (dark text on light tiles) and DARK
+                // (light text on dark tiles). Fallback to black if the
+                // L&F hasn't installed a Label.foreground yet.
+                Color labelColour = javax.swing.UIManager.getColor("Label.foreground");
+                if (labelColour == null) labelColour = Color.BLACK;
+
+                for (AdsbTrack t : store.allSnapshots()) {
                     if (!t.hasPosition()) continue;
                     Point2D p = viewer.getTileFactory().geoToPixel(
                             new GeoPosition(t.latitude(), t.longitude()),
@@ -192,11 +210,10 @@ public final class MapPanel extends JPanel {
                     Color c = altitudeColour(t.preferredAltFt());
                     drawAircraftGlyph(g, x, y, heading, c);
 
-                    // Label: callsign if known, else ICAO hex.
                     String label = t.callsign() != null && !t.callsign().isBlank()
                             ? t.callsign().trim()
                             : t.icaoHex();
-                    g.setColor(Color.BLACK);
+                    g.setColor(labelColour);
                     g.drawString(label, x + 8, y - 4);
                 }
             } finally {
@@ -205,20 +222,6 @@ public final class MapPanel extends JPanel {
         }
     }
 
-    /** Snapshot the store's current tracks. See {@link AircraftStateStore#allSnapshots()}. */
-    private List<AdsbTrack> snapshotList() {
-        return store.allSnapshots();
-    }
-
-    // ------------------------------------------------------------------
-    // glyph rendering
-    // ------------------------------------------------------------------
-
-    /**
-     * Draw a filled triangle pointing towards {@code headingDeg}
-     * (0 deg = north, clockwise), 14 px tall, centred on
-     * {@code (cx, cy)}.
-     */
     private static void drawAircraftGlyph(Graphics2D g, int cx, int cy,
                                            double headingDeg, Color fill) {
         AffineTransform old = g.getTransform();
@@ -240,19 +243,13 @@ public final class MapPanel extends JPanel {
         }
     }
 
-    /**
-     * Colour band by altitude. Nothing scientific -- just a visual cue:
-     * low aircraft (arriving/departing) tend to be more interesting to
-     * an operator watching a specific field, high aircraft (cruising)
-     * fade back.
-     */
     private static Color altitudeColour(int altFt) {
         if (altFt == Integer.MIN_VALUE) return Color.LIGHT_GRAY;
-        if (altFt <   5000) return new Color(0xC0, 0x39, 0x2B);   // red    - low
-        if (altFt <  10000) return new Color(0xE6, 0x7E, 0x22);   // orange
-        if (altFt <  20000) return new Color(0xF1, 0xC4, 0x0F);   // amber
-        if (altFt <  30000) return new Color(0x27, 0xAE, 0x60);   // green
-        if (altFt <  40000) return new Color(0x29, 0x80, 0xB9);   // blue
-        return                     new Color(0x8E, 0x44, 0xAD);   // purple - high cruise
+        if (altFt <   5000) return new Color(0xC0, 0x39, 0x2B);
+        if (altFt <  10000) return new Color(0xE6, 0x7E, 0x22);
+        if (altFt <  20000) return new Color(0xF1, 0xC4, 0x0F);
+        if (altFt <  30000) return new Color(0x27, 0xAE, 0x60);
+        if (altFt <  40000) return new Color(0x29, 0x80, 0xB9);
+        return                     new Color(0x8E, 0x44, 0xAD);
     }
 }
