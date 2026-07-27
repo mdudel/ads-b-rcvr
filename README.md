@@ -152,17 +152,6 @@ while (true) {
 
 ---
 
-## Integration with common tools
-
-| Tool | Protocol | Setting |
-|------|----------|---------|
-| Virtual Radar Server | TCP | Receiver → `AVR or Beast Raw Feed` on configured port |
-| PlaneFinder | TCP | Add receiver → `AVR over TCP` |
-| FlightAware | TCP | Use `--tcp-port 30003` and point piaware at host:port |
-| Wireshark | UDP/Multicast | Filter: `udp.port == 30003` |
-
----
-
 ## Architecture
 
 ```
