@@ -1,13 +1,9 @@
-# Build output — only the packaged jar under target/ is intentionally tracked
-# (see git ls-files target/); everything else is transient.
-target/classes/
-target/test-classes/
-target/maven-status/
-target/surefire-reports/
-target/generated-sources/
-target/generated-test-sources/
-target/original-*.jar
-target/maven-archiver/
+# Maven build output — regenerable, never tracked. Grab release binaries
+# from GitHub Releases rather than committing them into main.
+target/
+
+# Maven wrapper local install (harmless if unused)
+.mvn/wrapper/maven-wrapper.jar
 
 # IDE
 .idea/
