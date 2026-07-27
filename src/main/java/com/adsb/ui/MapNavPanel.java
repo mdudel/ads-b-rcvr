@@ -109,13 +109,14 @@ public final class MapNavPanel extends JPanel {
         g.insets = new Insets(1, 1, 1, 1);
         g.fill = GridBagConstraints.NONE;
 
-        // Unicode chevrons: BLACK UP-POINTING TRIANGLE etc. Rendered
-        // by FlatLaf's default button font, which handles them on
-        // every modern Windows / macOS / Linux JVM.
-        JButton n = panButton("\u25B2", "Pan north");
-        JButton s = panButton("\u25BC", "Pan south");
-        JButton w = panButton("\u25C4", "Pan west");
-        JButton e = panButton("\u25BA", "Pan east");
+        // Material Icons Regular chevrons. Falls back to unicode
+        // triangles if the icon font resource is missing (see
+        // MaterialIcon.UnicodeFallbackIcon). Icon inherits the host
+        // component's foreground so it re-tints on theme switch.
+        JButton n = panButton(MaterialIcon.of(MaterialIcon.Glyph.PAN_UP,    22), "Pan north");
+        JButton s = panButton(MaterialIcon.of(MaterialIcon.Glyph.PAN_DOWN,  22), "Pan south");
+        JButton w = panButton(MaterialIcon.of(MaterialIcon.Glyph.PAN_LEFT,  22), "Pan west");
+        JButton e = panButton(MaterialIcon.of(MaterialIcon.Glyph.PAN_RIGHT, 22), "Pan east");
         n.addActionListener(ev -> panPixels(0,        -stepY()));
         s.addActionListener(ev -> panPixels(0,         stepY()));
         w.addActionListener(ev -> panPixels(-stepX(),  0));
@@ -139,9 +140,8 @@ public final class MapNavPanel extends JPanel {
         z.setOpaque(false);
         z.setAlignmentX(CENTER_ALIGNMENT);
 
-        // Plain +/- glyphs. Bumped to 16pt bold so they read at 32x28.
-        JButton plus  = zoomButton("+", "Zoom in");
-        JButton minus = zoomButton("\u2212", "Zoom out"); // U+2212 MINUS SIGN
+        JButton plus  = zoomButton(MaterialIcon.of(MaterialIcon.Glyph.ZOOM_IN,  18), "Zoom in");
+        JButton minus = zoomButton(MaterialIcon.of(MaterialIcon.Glyph.ZOOM_OUT, 18), "Zoom out");
         plus .addActionListener(ev -> stepZoom(-1));   // viewer-zoom -1 = OSM Z+1 = closer
         minus.addActionListener(ev -> stepZoom(+1));   // viewer-zoom +1 = OSM Z-1 = wider
 
@@ -264,20 +264,17 @@ public final class MapNavPanel extends JPanel {
     // source in both LIGHT and DARK modes.
     // ------------------------------------------------------------------
 
-    private static JButton panButton(String glyph, String tooltip) {
-        return sizedButton(glyph, tooltip, 40, 36, 18f);
+    private static JButton panButton(javax.swing.Icon icon, String tooltip) {
+        return sizedButton(icon, tooltip, 40, 36);
     }
 
-    private static JButton zoomButton(String glyph, String tooltip) {
-        return sizedButton(glyph, tooltip, 32, 28, 16f);
+    private static JButton zoomButton(javax.swing.Icon icon, String tooltip) {
+        return sizedButton(icon, tooltip, 32, 28);
     }
 
-    private static JButton sizedButton(String glyph, String tooltip,
-                                        int w, int h, float pt) {
-        JButton b = new JButton(glyph);
-        Font base = UIManager.getFont("Button.font");
-        if (base == null) base = new Font(Font.SANS_SERIF, Font.PLAIN, 12);
-        b.setFont(base.deriveFont(Font.BOLD, pt));
+    private static JButton sizedButton(javax.swing.Icon icon, String tooltip,
+                                        int w, int h) {
+        JButton b = new JButton(icon);
         b.setMargin(new Insets(0, 0, 0, 0));
         b.setPreferredSize(new Dimension(w, h));
         b.setMinimumSize(new Dimension(w, h));

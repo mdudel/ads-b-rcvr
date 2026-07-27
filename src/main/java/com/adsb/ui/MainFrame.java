@@ -125,13 +125,21 @@ public final class MainFrame extends JFrame {
         toolbar.setFloatable(false);
         toolbar.setBorder(BorderFactory.createEmptyBorder(2, 4, 2, 4));
 
-        addToolbarButton(toolbar, ID_TRACKS,     "Tracks",     "Aircraft table (list of every tracked ICAO)",
+        addToolbarButton(toolbar, ID_TRACKS,     "Tracks",
+                MaterialIcon.of(MaterialIcon.Glyph.OVERLAYS, 18),
+                "Aircraft table (list of every tracked ICAO)",
                 () -> sideDock.toggle(ID_TRACKS,     "Tracks",     tracksPanel));
-        addToolbarButton(toolbar, ID_CONNECTORS, "Connectors", "Add / edit / remove output connectors",
+        addToolbarButton(toolbar, ID_CONNECTORS, "Connectors",
+                MaterialIcon.of(MaterialIcon.Glyph.TOOLS, 18),
+                "Add / edit / remove output connectors",
                 () -> sideDock.toggle(ID_CONNECTORS, "Connectors", connectorsPanel));
-        addToolbarButton(toolbar, ID_SETTINGS,   "Settings",   "CoT + receiver settings",
+        addToolbarButton(toolbar, ID_SETTINGS,   "Settings",
+                MaterialIcon.of(MaterialIcon.Glyph.SETTINGS, 18),
+                "CoT + receiver settings",
                 () -> sideDock.toggle(ID_SETTINGS,   "Settings",   settingsPanel));
-        addToolbarButton(toolbar, ID_ABOUT,      "About",      "Version + help + links",
+        addToolbarButton(toolbar, ID_ABOUT,      "About",
+                MaterialIcon.of(MaterialIcon.Glyph.ABOUT, 18),
+                "Version + help + links",
                 () -> sideDock.toggle(ID_ABOUT,      "About",      aboutPanel));
 
         // Theme cycle button, right side. Two-state (LIGHT <-> DARK)
@@ -179,13 +187,34 @@ public final class MainFrame extends JFrame {
         getContentPane().add(toolbar,  BorderLayout.NORTH);
         getContentPane().add(sideDock, BorderLayout.CENTER);
         getContentPane().add(south,    BorderLayout.SOUTH);
+
+        // Debug hook: -Dadsb.ui.autoOpen=tracks|connectors|settings|about
+        // pre-opens the named dock on startup. Used for headless
+        // screenshot smoke tests where we can't drive xdotool.
+        String autoOpen = System.getProperty("adsb.ui.autoOpen");
+        if (autoOpen != null) {
+            SwingUtilities.invokeLater(() -> {
+                switch (autoOpen.trim().toLowerCase()) {
+                    case "tracks"     -> sideDock.show(ID_TRACKS,     "Tracks",     tracksPanel);
+                    case "connectors" -> sideDock.show(ID_CONNECTORS, "Connectors", connectorsPanel);
+                    case "settings"   -> sideDock.show(ID_SETTINGS,   "Settings",   settingsPanel);
+                    case "about"      -> sideDock.show(ID_ABOUT,      "About",      aboutPanel);
+                    default           -> System.err.println(
+                            "[WARN] adsb.ui.autoOpen: unknown panel '" + autoOpen + "'");
+                }
+            });
+        }
     }
 
     private void addToolbarButton(JToolBar bar, String id, String label,
+                                   javax.swing.Icon icon,
                                    String tooltip, Runnable onClick) {
-        JButton b = new JButton(label);
+        JButton b = new JButton(label, icon);
         b.setToolTipText(tooltip);
         b.setFocusable(false);
+        // Icon on the left of the label, small gap between them.
+        b.setHorizontalTextPosition(javax.swing.SwingConstants.RIGHT);
+        b.setIconTextGap(6);
         b.addActionListener(e -> onClick.run());
         toolbarButtons.put(id, b);
         bar.add(b);

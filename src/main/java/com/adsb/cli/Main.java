@@ -126,6 +126,15 @@ public class Main {
                             initialTheme,
                             newTheme -> writeThemeMode(storePath, newTheme));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+                    // Belt-and-braces: even though initialTheme.apply()
+                    // ran BEFORE this invokeLater lambda was scheduled,
+                    // FlatLaf occasionally leaves specific widget
+                    // subtrees (esp. JTable in a lazily-shown
+                    // JScrollPane, per Marty 2026-07-27 14:49 UTC
+                    // screenshot) with cached Metal defaults. Force a
+                    // full tree walk so every widget re-resolves
+                    // UIManager colours against the current L&F.
+                    SwingUtilities.updateComponentTreeUI(frame);
                     frame.setVisible(true);
                 });
             }

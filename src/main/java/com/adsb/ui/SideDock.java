@@ -54,7 +54,7 @@ public final class SideDock extends JPanel {
         this.titleLabel = new JLabel(" ");
         this.titleLabel.setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
 
-        JButton closeBtn = new JButton("\u2715");
+        JButton closeBtn = new JButton(MaterialIcon.of(MaterialIcon.Glyph.CLOSE, 14));
         closeBtn.setToolTipText("Close panel");
         closeBtn.setFocusable(false);
         closeBtn.setMargin(new java.awt.Insets(0, 6, 0, 6));
@@ -65,7 +65,13 @@ public final class SideDock extends JPanel {
         JPanel closeCluster = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
         closeCluster.add(closeBtn);
         titleBar.add(closeCluster, BorderLayout.EAST);
-        titleBar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, java.awt.Color.LIGHT_GRAY));
+        // Divider colour follows the L&F so it contrasts against
+        // both light (dark divider on light surface) and dark (light
+        // divider on dark surface) themes. Fallback grey only if
+        // the L&F hasn't installed a Component.borderColor yet.
+        java.awt.Color dividerColour = javax.swing.UIManager.getColor("Component.borderColor");
+        if (dividerColour == null) dividerColour = java.awt.Color.LIGHT_GRAY;
+        titleBar.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, dividerColour));
 
         this.contentSlot = new JPanel(new BorderLayout());
 
@@ -94,6 +100,15 @@ public final class SideDock extends JPanel {
         titleLabel.setText(title);
         contentSlot.removeAll();
         contentSlot.add(content, BorderLayout.CENTER);
+        // The content panels (TracksPanel, ConnectorsPanel, ...) are
+        // constructed in MainFrame's ctor but only ADDED to the dock
+        // when the operator clicks a toolbar button. If a theme flip
+        // happened while they were detached, their widgets still hold
+        // the pre-flip L&F colours. Force a tree walk now so they
+        // pick up the current UIManager before they get painted.
+        if (content instanceof javax.swing.JComponent jc) {
+            javax.swing.SwingUtilities.updateComponentTreeUI(jc);
+        }
         contentSlot.revalidate();
         contentSlot.repaint();
         currentId = id;
