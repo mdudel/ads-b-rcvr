@@ -1,10 +1,18 @@
 package com.adsb.cli;
 
 import com.adsb.core.AdsbReceiver;
+import com.adsb.core.FrameForwarder;
+import com.adsb.core.PayloadFormat;
+import com.adsb.cot.CoTBuilder;
+import com.adsb.cot.IcaoAircraftClassifier;
+import com.adsb.cot.IcaoAircraftClassifier.Affiliation;
+import com.adsb.cot.IcaoAircraftClassifier.Category;
+import com.adsb.model.AircraftStateStore;
 import com.adsb.transport.MulticastForwarder;
 import com.adsb.transport.TcpForwarder;
 import com.adsb.transport.UdpForwarder;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -28,6 +36,8 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         Config cfg = parseArgs(args);
+
+        System.out.printf("[INFO] Payload format: %s%n", cfg.payload);
 
         // No forwarder args → default to console scroll mode
         if (!cfg.hasAnyForwarder()) {
@@ -66,9 +76,40 @@ public class Main {
             }
         }));
 
+        // State store + optional CoT listener. Both are always created when
+        // --payload cot is selected; the listener writes CoT XML bytes into
+        // the same forwarder set on every AircraftStateStore snapshot update.
+        AircraftStateStore stateStore = new AircraftStateStore();
+        CoTBuilder cotBuilder = null;
+        if (cfg.payload == PayloadFormat.COT) {
+            IcaoAircraftClassifier classifier = new IcaoAircraftClassifier(
+                    cfg.cotAffiliation, cfg.cotCategory);
+            cotBuilder = new CoTBuilder(classifier,
+                    cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds);
+
+            final CoTBuilder cotRef = cotBuilder;
+            final List<AutoCloseable> sinks = forwarders;
+            stateStore.addListener(snapshot -> {
+                String xml = cotRef.build(snapshot);
+                if (xml == null) return; // no position yet
+                byte[] bytes = xml.getBytes(StandardCharsets.UTF_8);
+                if (cfg.verbose) System.out.printf("[COT] %s%n", xml);
+                for (AutoCloseable f : sinks) {
+                    if (f instanceof FrameForwarder ff) {
+                        try { ff.forward(bytes); }
+                        catch (Exception e) {
+                            System.err.println("[WARN] CoT forward error ("
+                                    + f.getClass().getSimpleName() + "): " + e.getMessage());
+                        }
+                    }
+                }
+            });
+        }
+
         // Start receiver — blocks until process dies or SIGINT
         AdsbReceiver receiver = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
-                cfg.verbose, cfg.rtlPath);
+                cfg.verbose, cfg.rtlPath,
+                cfg.payload, stateStore, cotBuilder);
         receiver.start(forwarders);
     }
 
@@ -110,6 +151,25 @@ public class Main {
                 case "--verbose":
                     cfg.verbose = true;
                     break;
+                case "--payload":
+                    cfg.payload = PayloadFormat.parse(args[++i]);
+                    break;
+                case "--cot-affiliation":
+                    cfg.cotAffiliation = parseAffiliation(args[++i]);
+                    break;
+                case "--cot-category":
+                    cfg.cotCategory = parseCategory(args[++i]);
+                    break;
+                case "--cot-stale-air":
+                    cfg.cotStaleAirSeconds = Integer.parseInt(args[++i]);
+                    break;
+                case "--cot-stale-ground":
+                    cfg.cotStaleGroundSeconds = Integer.parseInt(args[++i]);
+                    break;
+                case "-h": case "--help":
+                    printUsage();
+                    System.exit(0);
+                    break;
                 default:
                     System.err.println("[WARN] Unknown argument: " + args[i]);
             }
@@ -117,35 +177,71 @@ public class Main {
         return cfg;
     }
 
+    private static Affiliation parseAffiliation(String s) {
+        return switch (s.trim().toLowerCase()) {
+            case "friendly" -> Affiliation.FRIENDLY;
+            case "neutral"  -> Affiliation.NEUTRAL;
+            case "hostile"  -> Affiliation.HOSTILE;
+            case "unknown"  -> Affiliation.UNKNOWN;
+            case "pending"  -> Affiliation.PENDING;
+            default -> throw new IllegalArgumentException("--cot-affiliation: " + s);
+        };
+    }
+
+    private static Category parseCategory(String s) {
+        return switch (s.trim().toLowerCase()) {
+            case "civilian", "civ" -> Category.CIVILIAN;
+            case "military", "mil" -> Category.MILITARY;
+            default -> throw new IllegalArgumentException("--cot-category: " + s);
+        };
+    }
+
     static void printUsage() {
         System.err.println("""
             Usage: java -jar adsb-forwarder.jar [options]
-            
-            Output (at least one required):
+
+            Output (at least one required, or run with no sink for stdout scroll):
               --udp <host:port>           UDP unicast destination
               --multicast <group:port>    UDP multicast group (e.g. 239.1.1.1:30003)
               --tcp-port <port>           TCP server port (clients connect to receive)
-            
+
+            Payload format (applies to every enabled sink):
+              --payload <avr|json|cot>    Wire format (default: json)
+                                          avr  = raw hex frames from rtl_adsb
+                                          json = decoded JSON (historical shape)
+                                          cot  = CoT XML air tracks (TAK-compatible)
+
+            CoT options (only used when --payload cot):
+              --cot-affiliation <friendly|neutral|hostile|unknown|pending>
+                                          Default: neutral (correct for civil airliners)
+              --cot-category <civilian|military>
+                                          Default: civilian
+              --cot-stale-air <seconds>   Stale offset for airborne tracks (default 30)
+              --cot-stale-ground <seconds>  Stale offset for on-ground tracks (default 120)
+
             RTL-SDR options:
               --rtl-device <index>        Device index (default: 0)
+              --rtl-path <dir>            Folder containing rtl_adsb.exe (if not on PATH)
               --gain <value>              Gain value or 'auto' (default: auto)
-              --format <avr|beast|raw>    Frame format (default: avr)
-            
+              --format <avr|beast|raw>    rtl_adsb frame format (default: avr)
+
             Other:
               --verbose                   Print frames to stdout
-            
+              -h, --help                  Show this help
+
             Examples:
-              # Forward to localhost:30003 via UDP
+              # Decoded JSON to localhost (historical default)
               java -jar adsb-forwarder.jar --udp 127.0.0.1:30003
-            
-              # TCP server on port 30003 (e.g. for dump1090-compatible clients)
-              java -jar adsb-forwarder.jar --tcp-port 30003
-            
-              # All three simultaneously
-              java -jar adsb-forwarder.jar \\
-                --udp 192.168.1.100:30003 \\
-                --multicast 239.1.1.1:30003 \\
-                --tcp-port 30003 --verbose
+
+              # Raw AVR frames to a downstream decoder
+              java -jar adsb-forwarder.jar --payload avr --tcp-port 30005
+
+              # CoT XML air tracks to WinTAK / ATAK
+              java -jar adsb-forwarder.jar --payload cot --udp 127.0.0.1:6969
+
+              # CoT to a multicast group, longer air-stale window, verbose
+              java -jar adsb-forwarder.jar --payload cot \\
+                --multicast 239.2.3.1:6969 --cot-stale-air 60 --verbose
             """);
     }
 
@@ -164,6 +260,13 @@ public class Main {
         String gain         = "auto";
         String format       = "avr";
         boolean verbose     = false;
+
+        // Payload / CoT knobs
+        PayloadFormat payload = PayloadFormat.JSON;
+        Affiliation cotAffiliation = null;   // null -> classifier default (neutral)
+        Category    cotCategory    = null;   // null -> classifier default (civilian)
+        int cotStaleAirSeconds     = 30;
+        int cotStaleGroundSeconds  = 120;
 
         boolean hasAnyForwarder() {
             return udpHost != null || multicastGroup != null || tcpPort > 0;

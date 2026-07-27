@@ -1,5 +1,7 @@
 package com.adsb.core;
 
+import com.adsb.model.AdsbFrame;
+
 import java.time.Instant;
 
 /**
@@ -29,6 +31,135 @@ public class AdsbDecoder {
     // ADS-B callsign character table
     private static final String CALLSIGN_CHARS =
             "#ABCDEFGHIJKLMNOPQRSTUVWXYZ#####_###############0123456789######";
+
+    /**
+     * Decodes a single AVR line into a typed {@link AdsbFrame} for the
+     * {@link com.adsb.model.AircraftStateStore} pipeline. Returns {@code null}
+     * if the line is malformed or the frame variant is not modelled.
+     *
+     * <p>This is additive to {@link #decode(String)} — both may be called on
+     * the same input independently; parse work is not shared but is cheap.
+     */
+    public static AdsbFrame decodeTyped(String avrLine) {
+        byte[] msg = parseAvr(avrLine);
+        if (msg == null) return null;
+        int df = (msg[0] & 0xFF) >> 3;
+        switch (df) {
+            case 0: case 4: {
+                if (msg.length < 3) return null;
+                int alt = decodeGillhamAltitude(msg, 1);
+                if (alt == Integer.MIN_VALUE) return null;
+                // Short-form surveillance frames don't carry ICAO in the clear
+                // (it's XOR-mixed with AP/parity). Skip — the DF17/18 stream is
+                // where the useful state lives anyway.
+                return null;
+            }
+            case 5: case 21: {
+                if (msg.length < 3) return null;
+                String sq = decodeSquawk(msg);
+                if (sq == null) return null;
+                // Same ICAO-in-AP caveat as DF0/4.
+                return null;
+            }
+            case 11: {
+                if (msg.length < 4) return null;
+                return new AdsbFrame.AllCall(icaoHex(msg, 1));
+            }
+            case 17: case 18: {
+                if (msg.length < 11) return null;
+                String icao = icaoHex(msg, 1);
+                int tc = (msg[4] & 0xFF) >> 3;
+                if (tc >= 1 && tc <= 4) {
+                    String cs = decodeCallsign(msg);
+                    if (cs != null) cs = cs.trim().replaceAll("#+$", "");
+                    int cat = tc * 8 + (msg[4] & 0x07);
+                    String catStr = emitterCategoryCode(tc, cat);
+                    return new AdsbFrame.Identification(icao, cs, catStr);
+                }
+                if ((tc >= 9 && tc <= 18) || (tc >= 20 && tc <= 22)) {
+                    int altCode = ((msg[5] & 0xFF) << 4) | ((msg[6] & 0xFF) >> 4);
+                    int alt = decodeModeCAlt(altCode);
+                    int cprFormat = (msg[6] >> 2) & 0x01;
+                    int cprLat = ((msg[6] & 0x03) << 15) | ((msg[7] & 0xFF) << 7) | ((msg[8] & 0xFF) >> 1);
+                    int cprLon = ((msg[8] & 0x01) << 16) | ((msg[9] & 0xFF) << 8) | (msg[10] & 0xFF);
+                    double[] ll = cprApproxDecode(cprLat, cprLon, cprFormat);
+                    if (ll == null) return null;
+                    boolean geometric = (tc >= 20 && tc <= 22);
+                    return new AdsbFrame.AirbornePosition(icao, ll[0], ll[1],
+                            alt == Integer.MIN_VALUE ? Integer.MIN_VALUE : alt,
+                            geometric);
+                }
+                if (tc == 19) {
+                    int subtype = msg[4] & 0x07;
+                    Double gs = null, hdg = null;
+                    int vRate = Integer.MIN_VALUE;
+                    if (subtype == 1 || subtype == 2) {
+                        boolean dEW = (msg[5] & 0x04) != 0;
+                        int vEW = ((msg[5] & 0x03) << 8) | (msg[6] & 0xFF);
+                        boolean dNS = (msg[7] & 0x80) != 0;
+                        int vNS = ((msg[7] & 0x7F) << 3) | ((msg[8] & 0xFF) >> 5);
+                        if (vEW != 0 && vNS != 0) {
+                            double ewKts = (vEW - 1) * (subtype == 2 ? 4 : 1) * (dEW ? -1 : 1);
+                            double nsKts = (vNS - 1) * (subtype == 2 ? 4 : 1) * (dNS ? -1 : 1);
+                            gs  = Math.sqrt(ewKts * ewKts + nsKts * nsKts);
+                            double h = Math.toDegrees(Math.atan2(ewKts, nsKts));
+                            if (h < 0) h += 360;
+                            hdg = h;
+                        }
+                    }
+                    int vrSign = (msg[8] & 0x08) >> 3;
+                    int vrRaw  = ((msg[8] & 0x07) << 6) | ((msg[9] & 0xFF) >> 2);
+                    if (vrRaw != 0) vRate = (vrRaw - 1) * 64 * (vrSign == 1 ? -1 : 1);
+                    if (gs != null && hdg != null) {
+                        return new AdsbFrame.AirborneVelocity(icao, gs, hdg, vRate);
+                    }
+                    return null;
+                }
+                if (tc == 28) {
+                    int status = (msg[5] & 0xE0) >> 5;
+                    return new AdsbFrame.AircraftStatus(icao, status);
+                }
+                return null;
+            }
+            case 20: {
+                if (msg.length < 3) return null;
+                int alt = decodeGillhamAltitude(msg, 2);
+                if (alt == Integer.MIN_VALUE) return null;
+                return null; // ICAO in AP field
+            }
+            default: return null;
+        }
+    }
+
+    /**
+     * DO-260B emitter category codes as strings ("A1".. "D7").
+     * Set bits: (aircraft-type-code, category-subtype). ADS-B v0/v1 use
+     * TC 1..4 as the set and (msg[4] &amp; 0x07) as the subtype.
+     */
+    private static String emitterCategoryCode(int tc, int cat) {
+        char set = switch (tc) {
+            case 4 -> 'A';
+            case 3 -> 'B';
+            case 2 -> 'C';
+            case 1 -> 'D';
+            default -> '?';
+        };
+        int sub = cat & 0x07;
+        if (set == '?' || sub == 0) return null;
+        return "" + set + sub;
+    }
+
+    /** Trim leading * and trailing ; and parse hex; returns null on any parse failure. */
+    private static byte[] parseAvr(String avrLine) {
+        if (avrLine == null) return null;
+        String hex = avrLine.trim();
+        if (hex.startsWith("*")) hex = hex.substring(1);
+        if (hex.endsWith(";"))   hex = hex.substring(0, hex.length() - 1);
+        hex = hex.trim();
+        if (hex.isEmpty() || hex.length() < 2 || hex.length() % 2 != 0) return null;
+        try { return hexToBytes(hex); }
+        catch (NumberFormatException e) { return null; }
+    }
 
     /**
      * Decodes a single AVR line (e.g. "*8D4B1A00EA2B5C...;") into JSON.

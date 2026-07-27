@@ -1,0 +1,22 @@
+# Build output — only the packaged jar under target/ is intentionally tracked
+# (see git ls-files target/); everything else is transient.
+target/classes/
+target/test-classes/
+target/maven-status/
+target/surefire-reports/
+target/generated-sources/
+target/generated-test-sources/
+target/original-*.jar
+target/maven-archiver/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db

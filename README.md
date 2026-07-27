@@ -4,6 +4,14 @@ Receives ADS-B Mode S frames from an RTL-SDR dongle via `rtl_adsb.exe` and
 forwards them over **UDP unicast**, **UDP multicast**, or **TCP**.
 All three transports can run simultaneously.
 
+**Payload format is selectable** via `--payload`:
+
+| Value | Wire content | Downstream consumers |
+|-------|--------------|----------------------|
+| `json` *(default)* | Decoded JSON, one object per frame | Custom pipelines, log processors |
+| `avr` | Raw hex AVR frames (`*8D...;`) | Virtual Radar Server, PlaneFinder, dump1090-compatible tools |
+| `cot` | CoT XML `<event>` per aircraft snapshot | **WinTAK, ATAK, GCCS-J COP, TAK Server** |
+
 ---
 
 ## Prerequisites
@@ -79,6 +87,17 @@ RTL-SDR options:
   --gain <value>              Gain value e.g. 40, or omit for auto
   --format <avr|raw>          Frame format (default: avr)
 
+Payload format (applies to every enabled sink):
+  --payload <avr|json|cot>    Wire format (default: json)
+
+CoT options (only used when --payload cot):
+  --cot-affiliation <friendly|neutral|hostile|unknown|pending>
+                              Default: neutral (correct for civil airliners)
+  --cot-category <civilian|military>
+                              Default: civilian
+  --cot-stale-air <seconds>   Stale offset for airborne tracks (default 30)
+  --cot-stale-ground <seconds> Stale offset for on-ground tracks (default 120)
+
 Other:
   --verbose                   Print frames to console
 ```
@@ -86,6 +105,14 @@ Other:
 ---
 
 ## Examples
+
+### CoT XML air tracks to WinTAK / ATAK (new)
+```cmd
+run.bat --payload cot --udp 127.0.0.1:6969 --verbose
+```
+Emits one CoT `<event>` per aircraft *snapshot update* (emit-on-change). Point
+your TAK client at the same UDP address. Default type is `a-n-A-C-F` (neutral
+civilian fixed-wing); use `--cot-affiliation` / `--cot-category` to override.
 
 ### TCP server on port 30003
 ```cmd
