@@ -125,15 +125,27 @@ public class Main {
         }
 
         // Shutdown hook closes every attached sink.
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("[INFO] Shutting down\u2026");
-            sinks.closeAll();
-        }));
-
-        // Start receiver \u2014 blocks on the rtl_adsb stdout stream.
+        // Build the receiver up-front so the shutdown hook can see it
+        // and politely stop the rtl_adsb subprocess. Order matters:
+        // the child MUST be terminated before the JVM exits, otherwise
+        // libusb-1.0 on Windows leaks the USB endpoint and the next
+        // launch fails with 'usb_open error -3' (issue #13).
         AdsbReceiver receiver = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
                 cfg.verbose, cfg.rtlPath,
                 stateStore, liveBuilder.get(), sinks);
+
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("[INFO] Shutting down\u2026");
+            // Stop the subprocess FIRST so it can release the USB
+            // endpoint before we close sockets.
+            try { receiver.stop(); }
+            catch (Exception e) {
+                System.err.println("[WARN] Error stopping rtl_adsb: " + e);
+            }
+            sinks.closeAll();
+        }, "adsb-shutdown"));
+
+        // Start receiver -- blocks on the rtl_adsb stdout stream.
         receiver.start();
     }
 

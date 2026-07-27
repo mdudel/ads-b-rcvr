@@ -15,6 +15,8 @@ import javax.swing.JToolBar;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.WindowConstants;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
@@ -76,7 +78,22 @@ public final class MainFrame extends JFrame {
         this.attacher        = attacher;
         this.liveBuilder     = liveBuilder;
 
-        setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+        // DO_NOTHING here + explicit windowClosing handler below so we
+        // can run the shutdown hook (which stops rtl_adsb + releases the
+        // USB endpoint) before the JVM exits. DISPOSE_ON_CLOSE alone
+        // leaves the receiver thread blocked on rtl_adsb stdout so the
+        // JVM never exits, the operator kills it via Task Manager, and
+        // rtl_adsb gets orphaned holding the USB device (issue #13).
+        setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+        addWindowListener(new WindowAdapter() {
+            @Override public void windowClosing(WindowEvent e) {
+                // System.exit runs shutdown hooks (which stop rtl_adsb)
+                // then terminates every non-daemon thread including the
+                // receiver's blocking read loop. Clean tear-down.
+                dispose();
+                System.exit(0);
+            }
+        });
         setSize(new Dimension(1200, 800));
         setLocationRelativeTo(null);
 

@@ -46,6 +46,35 @@ public class AdsbReceiver {
     private final SinkRegistry   sinks;
 
     /**
+     * Handle to the running {@code rtl_adsb} subprocess so external
+     * callers (shutdown hook, UI stop button) can politely tear it
+     * down. Held as a volatile ref so we can null-check without
+     * locking; {@link Process} itself is thread-safe for
+     * {@code destroy}/{@code destroyForcibly}.
+     *
+     * <p><b>Why this exists (issue #13):</b> if the JVM exits without
+     * signalling {@code rtl_adsb.exe} first, the child holds the USB
+     * endpoint until Windows notices its parent is gone (which can
+     * take 30-120s or need a device reset). The operator then sees
+     * {@code usb_open error -3} on the next launch and has to unplug
+     * the dongle. Cleaning up here fixes the common exit paths
+     * (Ctrl+C, UI close, System.exit). Hard-kills (kill -9, JVM crash,
+     * OS force-close) still leak the child because shutdown hooks
+     * don't run then — nothing at the Java layer can help there.</p>
+     */
+    private volatile Process rtlProc;
+
+    /**
+     * Set true by {@link #stop()} so the read loop knows that any
+     * subsequent IOException from the child's stdout pipe is an
+     * expected consequence of teardown, not a real error. Race:
+     * stop() calls destroy(), the pipe closes, readLine throws
+     * IMMEDIATELY -- often before proc.isAlive() flips to false.
+     * The flag closes the race deterministically.
+     */
+    private volatile boolean stopping;
+
+    /**
      * @param stateStore may be null when the receiver is only serving
      *                   stateless AVR/JSON sinks
      * @param cotBuilder may be null when no CoT sink is envisaged; only
@@ -104,6 +133,7 @@ public class AdsbReceiver {
         pb.redirectErrorStream(false);
         System.out.println("[INFO] Starting: " + String.join(" ", pb.command()));
         Process proc = pb.start();
+        this.rtlProc = proc;
 
         // Drain stderr in a background daemon thread to prevent pipe blocking.
         Thread stderrDrainer = new Thread(() -> {
@@ -124,7 +154,17 @@ public class AdsbReceiver {
             String line;
             long frameCount = 0;
 
-            while ((line = reader.readLine()) != null) {
+            while (true) {
+                try {
+                    line = reader.readLine();
+                } catch (java.io.IOException e) {
+                    // Expected on shutdown: stop() closed the subprocess
+                    // which slammed our end of its stdout pipe. Not an
+                    // error, just our cue to stop reading.
+                    if (stopping || !proc.isAlive()) break;
+                    throw e;
+                }
+                if (line == null) break;
                 line = line.trim();
                 if (line.isEmpty()) continue;
                 frameCount++;
@@ -169,10 +209,54 @@ public class AdsbReceiver {
                     }
                 }
             }
+        } catch (java.io.IOException e) {
+            // Same stream-closed race on shutdown; swallow if we're
+            // already tearing down, otherwise re-throw.
+            if (!stopping && proc.isAlive()) throw e;
         }
 
-        int exit = proc.waitFor();
+        int exit;
+        try {
+            exit = proc.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            exit = -1;
+        }
+        this.rtlProc = null;
         System.out.printf("[INFO] rtl_adsb exited with code %d%n", exit);
+    }
+
+    /**
+     * Politely terminate any running {@code rtl_adsb} subprocess.
+     * Called from the shutdown hook so the child cleans up its libusb
+     * handle before Windows notices we're gone. Idempotent; safe to
+     * call when no subprocess is running.
+     *
+     * <p>Sequence: {@code destroy()} first (SIGTERM on POSIX,
+     * CTRL_BREAK on Windows via Java 9+ ProcessHandle) so
+     * {@code rtl_adsb} gets a chance to run its own atexit /
+     * {@code rtlsdr_close()} cleanup. Wait up to 2 s. If still alive,
+     * {@code destroyForcibly()} (SIGKILL / TerminateProcess). 2 s is
+     * generous — rtl_adsb typically returns from its sample loop and
+     * closes the device in < 200 ms.
+     */
+    public void stop() {
+        this.stopping = true;
+        Process p = this.rtlProc;
+        if (p == null || !p.isAlive()) return;
+        System.out.println("[INFO] Stopping rtl_adsb subprocess…");
+        p.destroy();
+        try {
+            if (!p.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                System.out.println("[WARN] rtl_adsb did not exit within 2s; forcing.");
+                p.destroyForcibly();
+                p.waitFor(1, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            p.destroyForcibly();
+        }
+        this.rtlProc = null;
     }
 
     private ProcessBuilder buildProcess() throws java.io.FileNotFoundException {
