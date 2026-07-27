@@ -127,13 +127,87 @@ public class AdsbReceiver {
         start();
     }
 
-    /** Modern start: sinks come from the {@link SinkRegistry}, mutated live. */
+    /**
+     * Maximum number of times {@link #start()} will relaunch
+     * {@code rtl_adsb} after seeing {@code usb_open error -3} in its
+     * stderr (issue #13). Includes the initial attempt, so
+     * {@code MAX_USB_LAUNCH_ATTEMPTS = 4} = one first try + three
+     * retries. Set conservatively: if three ~3s waits haven't cleared
+     * the USB endpoint lock, no amount of waiting will — the operator
+     * needs to unplug/replug the dongle.
+     */
+    private static final int MAX_USB_LAUNCH_ATTEMPTS = 4;
+
+    /** Seconds to wait between USB-lock retries. */
+    private static final int USB_RETRY_DELAY_SECONDS = 3;
+
+    /**
+     * Regex substring signalling a locked USB endpoint from a previous
+     * {@code rtl_adsb} (or another SDR tool) that didn't shut down
+     * cleanly. The libusb-1.0 error name is {@code LIBUSB_ERROR_ACCESS};
+     * librtlsdr prints the negative errno directly.
+     */
+    private static final String USB_ACCESS_ERROR_MARKER = "usb_open error -3";
+
+    /**
+     * Modern start: sinks come from the {@link SinkRegistry}, mutated
+     * live. On {@code usb_open error -3} at launch, waits
+     * {@value #USB_RETRY_DELAY_SECONDS} s and relaunches, up to
+     * {@value #MAX_USB_LAUNCH_ATTEMPTS} attempts, before giving up.
+     */
     public void start() throws Exception {
+        for (int attempt = 1; attempt <= MAX_USB_LAUNCH_ATTEMPTS; attempt++) {
+            if (stopping) return;
+            LaunchResult r = launchOnce(attempt);
+            if (r == LaunchResult.STARTED_AND_EXITED_NORMALLY) return;
+            if (r != LaunchResult.USB_LOCKED) return; // some other error; surfaced by launchOnce
+            if (attempt == MAX_USB_LAUNCH_ATTEMPTS) {
+                System.err.println(
+                        "[ERROR] rtl_adsb still reporting 'usb_open error -3' after "
+                        + MAX_USB_LAUNCH_ATTEMPTS + " attempts.\n"
+                      + "        The RTL-SDR dongle's USB endpoint appears locked.\n"
+                      + "        Unplug the dongle and reconnect it, then relaunch.");
+                return;
+            }
+            System.out.printf("[WARN] rtl_adsb hit usb_open error -3 (attempt %d/%d). "
+                    + "Waiting %ds for the USB endpoint to release, then retrying…%n",
+                    attempt, MAX_USB_LAUNCH_ATTEMPTS, USB_RETRY_DELAY_SECONDS);
+            try { Thread.sleep(USB_RETRY_DELAY_SECONDS * 1000L); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+        }
+    }
+
+    /** Outcome of one child-process lifecycle. */
+    private enum LaunchResult {
+        /** Child ran and exited normally, or shutdown()-was called. Don't retry. */
+        STARTED_AND_EXITED_NORMALLY,
+        /** Child failed to open the USB device (locked). Retry is worthwhile. */
+        USB_LOCKED,
+        /** Child failed for some other reason. Already surfaced; don't retry. */
+        OTHER_FAILURE
+    }
+
+    /**
+     * Spawn one {@code rtl_adsb} child, drain stdout into the payload
+     * pipeline, drain stderr into a watched buffer, and classify the
+     * exit result. Blocks until the child exits or {@link #stop()} is
+     * called.
+     */
+    private LaunchResult launchOnce(int attempt) throws Exception {
         ProcessBuilder pb = buildProcess();
         pb.redirectErrorStream(false);
-        System.out.println("[INFO] Starting: " + String.join(" ", pb.command()));
+        if (attempt == 1) {
+            System.out.println("[INFO] Starting: " + String.join(" ", pb.command()));
+        } else {
+            System.out.printf("[INFO] Restarting rtl_adsb (attempt %d/%d)…%n",
+                    attempt, MAX_USB_LAUNCH_ATTEMPTS);
+        }
         Process proc = pb.start();
         this.rtlProc = proc;
+
+        // Watched stderr flag: set when we see the USB-locked marker.
+        final java.util.concurrent.atomic.AtomicBoolean sawUsbLock =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
 
         // Drain stderr in a background daemon thread to prevent pipe blocking.
         Thread stderrDrainer = new Thread(() -> {
@@ -141,6 +215,9 @@ public class AdsbReceiver {
                     new InputStreamReader(proc.getErrorStream(), Charset.defaultCharset()))) {
                 String line;
                 while ((line = err.readLine()) != null) {
+                    if (line.contains(USB_ACCESS_ERROR_MARKER)) {
+                        sawUsbLock.set(true);
+                    }
                     System.err.println("[rtl_adsb] " + line);
                 }
             } catch (Exception ignored) {}
@@ -224,6 +301,18 @@ public class AdsbReceiver {
         }
         this.rtlProc = null;
         System.out.printf("[INFO] rtl_adsb exited with code %d%n", exit);
+
+        // Give the stderr drainer a brief chance to flush the tail of
+        // its buffer so the USB-lock marker has a chance to arrive
+        // before we classify. 200 ms is plenty; the child is already
+        // dead and its stderr FD is at EOF.
+        try { stderrDrainer.join(200); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        if (stopping) return LaunchResult.STARTED_AND_EXITED_NORMALLY;
+        if (exit != 0 && sawUsbLock.get()) return LaunchResult.USB_LOCKED;
+        if (exit == 0) return LaunchResult.STARTED_AND_EXITED_NORMALLY;
+        return LaunchResult.OTHER_FAILURE;
     }
 
     /**
