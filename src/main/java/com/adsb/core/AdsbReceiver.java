@@ -27,12 +27,15 @@ public class AdsbReceiver {
     private final PayloadFormat  payload;
     private final AircraftStateStore stateStore;
     private final CoTBuilder     cotBuilder;
+    private final double  rxLat;
+    private final double  rxLon;
 
     public AdsbReceiver(int deviceIndex, String gain, String format,
                         boolean verbose, String rtlPath,
                         PayloadFormat payload,
                         AircraftStateStore stateStore,
-                        CoTBuilder cotBuilder) {
+                        CoTBuilder cotBuilder,
+                        double rxLat, double rxLon) {
         this.deviceIndex = deviceIndex;
         this.gain        = gain;
         this.format      = format;
@@ -41,6 +44,8 @@ public class AdsbReceiver {
         this.payload     = payload == null ? PayloadFormat.JSON : payload;
         this.stateStore  = stateStore;
         this.cotBuilder  = cotBuilder;
+        this.rxLat       = rxLat;
+        this.rxLon       = rxLon;
     }
 
     /**
@@ -51,7 +56,8 @@ public class AdsbReceiver {
     public AdsbReceiver(int deviceIndex, String gain, String format,
                         boolean verbose, String rtlPath) {
         this(deviceIndex, gain, format, verbose, rtlPath,
-             PayloadFormat.JSON, null, null);
+             PayloadFormat.JSON, null, null,
+             Double.NaN, Double.NaN);
     }
 
     public void start(List<? extends AutoCloseable> forwarders) throws Exception {
@@ -88,7 +94,7 @@ public class AdsbReceiver {
                 // CoT emission path via a listener, decoupled from the
                 // per-line forwarding loop below.
                 if (stateStore != null) {
-                    AdsbFrame typed = AdsbDecoder.decodeTyped(line);
+                    AdsbFrame typed = AdsbDecoder.decodeTyped(line, rxLat, rxLon);
                     if (typed != null) TrackMerger.merge(stateStore, typed);
                 }
 

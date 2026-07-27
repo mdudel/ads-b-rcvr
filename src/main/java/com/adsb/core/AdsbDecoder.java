@@ -39,8 +39,31 @@ public class AdsbDecoder {
      *
      * <p>This is additive to {@link #decode(String)} — both may be called on
      * the same input independently; parse work is not shared but is cheap.
+     *
+     * <p><b>Position frames are skipped</b> in this no-reference overload.
+     * Airborne CPR cannot be decoded from a single frame without either a
+     * known nearby reference position or a paired even/odd frame within
+     * ≅10 s. The previous implementation produced aliased garbage lat/lon
+     * (typically ~5000 km off). Callers who want positions should use
+     * {@link #decodeTyped(String, double, double)} with a receiver
+     * reference position.
      */
     public static AdsbFrame decodeTyped(String avrLine) {
+        return decodeTyped(avrLine, Double.NaN, Double.NaN);
+    }
+
+    /**
+     * Same as {@link #decodeTyped(String)} but with a receiver reference
+     * position used to unambiguously decode airborne CPR positions on a
+     * single-frame basis (local decode per ICAO Doc 9871 App. C /
+     * RTCA DO-260B).
+     *
+     * @param refLat receiver latitude in degrees WGS-84, or {@link Double#NaN}
+     *               to skip position decode
+     * @param refLon receiver longitude in degrees WGS-84, or {@link Double#NaN}
+     *               to skip position decode
+     */
+    public static AdsbFrame decodeTyped(String avrLine, double refLat, double refLon) {
         byte[] msg = parseAvr(avrLine);
         if (msg == null) return null;
         int df = (msg[0] & 0xFF) >> 3;
@@ -77,13 +100,19 @@ public class AdsbDecoder {
                     return new AdsbFrame.Identification(icao, cs, catStr);
                 }
                 if ((tc >= 9 && tc <= 18) || (tc >= 20 && tc <= 22)) {
+                    // Skip position frames entirely when no reference is
+                    // supplied — emitting single-frame-approximate CPR was
+                    // the source of the 5000+ km aliasing bug. Global
+                    // (even+odd pair) decode without a reference is tracked
+                    // in issue #1.
+                    if (Double.isNaN(refLat) || Double.isNaN(refLon)) return null;
+
                     int altCode = ((msg[5] & 0xFF) << 4) | ((msg[6] & 0xFF) >> 4);
                     int alt = decodeModeCAlt(altCode);
                     int cprFormat = (msg[6] >> 2) & 0x01;
                     int cprLat = ((msg[6] & 0x03) << 15) | ((msg[7] & 0xFF) << 7) | ((msg[8] & 0xFF) >> 1);
                     int cprLon = ((msg[8] & 0x01) << 16) | ((msg[9] & 0xFF) << 8) | (msg[10] & 0xFF);
-                    double[] ll = cprApproxDecode(cprLat, cprLon, cprFormat);
-                    if (ll == null) return null;
+                    double[] ll = CprDecoder.localAirborne(cprLat, cprLon, cprFormat, refLat, refLon);
                     boolean geometric = (tc >= 20 && tc <= 22);
                     return new AdsbFrame.AirbornePosition(icao, ll[0], ll[1],
                             alt == Integer.MIN_VALUE ? Integer.MIN_VALUE : alt,

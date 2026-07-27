@@ -97,6 +97,10 @@ CoT options (only used when --payload cot):
                               Default: civilian
   --cot-stale-air <seconds>   Stale offset for airborne tracks (default 30)
   --cot-stale-ground <seconds> Stale offset for on-ground tracks (default 120)
+  --rx-latlon <lat,lon>       Receiver WGS-84 position (REQUIRED for
+                              positions in CoT mode). Without it, position
+                              frames are skipped; only callsign + velocity
+                              reach the map. Example: 50.04277,8.32778
 
 Other:
   --verbose                   Print frames to console
@@ -118,8 +122,16 @@ run.bat --payload avr --tcp-port 30003
 
 ### CoT XML air tracks to WinTAK / ATAK / TAK Server
 ```cmd
-run.bat --payload cot --udp 127.0.0.1:6969 --verbose
+run.bat --payload cot --rx-latlon 50.04277,8.32778 --udp 127.0.0.1:6969 --verbose
 ```
+**`--rx-latlon` is effectively required** in CoT mode — without your
+receiver's own WGS-84 position, the CPR position decoder can't tell
+which lat/lon zone the aircraft is in and will refuse to emit positions
+(preventing the 5000+ km aliasing bug that a naked single-frame
+approximation would cause). Callsign + velocity still surface, but the
+map picture will have no icons. A rough position (a few decimal-degrees
+accurate) is fine — the local decode just needs to unambiguously pick
+the correct zone.
 
 ### CoT to a multicast group with a longer stale window
 ```cmd

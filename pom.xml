@@ -24,12 +24,51 @@
     </properties>
 
     <dependencies>
-        <!-- No external runtime dependencies — pure JDK -->
+        <!--
+            Runtime deps required by the vendored OpenSky java-adsb sources
+            in src/main/java/org/opensky/. Not consumed by com.adsb.* yet;
+            added here to keep `mvn compile` green while that code lives
+            in-tree.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.13</version>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.13</version>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.14.0</version>
+        </dependency>
 
         <!-- Test -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            The vendored OpenSky java-adsb tests under
+            src/test/java/org/opensky/ are written against JUnit 4;
+            Surefire's Vintage engine will run them alongside our
+            JUnit 5 tests without modifying vendor code.
+        -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.vintage</groupId>
+            <artifactId>junit-vintage-engine</artifactId>
             <version>5.10.2</version>
             <scope>test</scope>
         </dependency>
