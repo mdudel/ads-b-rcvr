@@ -290,17 +290,25 @@ public final class OpenSkyFrameAdapter {
         lastGoodPositions.put(icao,
                 new LastGoodPosition(p.getLatitude(), p.getLongitude(), timeSec));
 
+        // OpenSky's AirbornePositionV0Msg.getAltitude() returns the
+        // DECODED value from the 12-bit AC field of a DF17/18 TC 9-18
+        // (or TC 20-22) frame -- units are FEET per DO-260B (Q=1 -> 25 ft
+        // increments offset -1000 ft; Q=0 -> Gillham gray-code, 100/500 ft).
+        // Do NOT convert with /0.3048 here; that would divide feet by
+        // metres-per-foot and shrink every altitude by 3.281x (35000 ft
+        // aircraft would show up as ~10668 ft in TAK, matching the
+        // "altitude way off" field bug 2026-07-28 08:00 UTC).
         int altFt = Integer.MIN_VALUE;
         if (pos.hasAltitude()) {
-            Integer altM = pos.getAltitude();
-            if (altM != null) altFt = (int) Math.round(altM / 0.3048);
+            Integer altFtBoxed = pos.getAltitude();
+            if (altFtBoxed != null) altFt = altFtBoxed;
         }
         // AirbornePositionV0Msg vs V2Msg: v2 messages report GNSS geometric
         // altitude when the frame's TC is 20-22. The base class exposes
         // hasAltitude() uniformly; we tag geometric based on the wrapper
         // subclass (v0 wrapper == baro; v1/v2 wrapper doesn't distinguish
-        // here \u2014 keep as baro, which matches Marty's current pom-independent
-        // behaviour. GNSS-geometric preference is tracked in #6.).
+        // here -- keep as baro, which matches current behaviour.
+        // GNSS-geometric preference is tracked in issue #6.)
         boolean geometric = false;
 
         return new AdsbFrame.AirbornePosition(icao,

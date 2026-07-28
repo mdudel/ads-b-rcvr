@@ -120,6 +120,72 @@ class OpenSkyFrameAdapterTest {
     }
 
     @Test
+    void airborne_position_altitude_round_trips_in_feet_not_metres() {
+        // Regression pin for the 2026-07-28 08:00 UTC field bug:
+        // OpenSky's AirbornePositionV0Msg.getAltitude() returns FEET
+        // per DO-260B (25 ft or 100 ft increments). An earlier version
+        // of this adapter named the return value "altM" and divided by
+        // 0.3048, shrinking every altitude by ~3.281x -- a 38000 ft
+        // airliner would land on the CoT wire as ~11582 ft, which
+        // Marty saw in WinTAK as FL115 instead of FL380.
+        //
+        // Pin: encode a real Q=1 25-ft-increment altitude, decode
+        // through the full adapter, assert we get 38000 ft back (not
+        // ~11582 ft).
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        int truthAltFt = 38000;
+        double truthLat = 49.98;
+        double truthLon =  8.55;
+        String icao = "40621D";
+
+        AdsbFrame.AirbornePosition last = null;
+        for (int i = 0; i < 4; i++) {
+            AdsbFrame f0 = a.decode(encodePosWithAlt(icao, truthLat, truthLon, 0, truthAltFt));
+            AdsbFrame f1 = a.decode(encodePosWithAlt(icao, truthLat, truthLon, 1, truthAltFt));
+            if (f0 instanceof AdsbFrame.AirbornePosition p) last = p;
+            if (f1 instanceof AdsbFrame.AirbornePosition p) last = p;
+        }
+        assertNotNull(last, "an AirbornePosition should emerge from paired even+odd frames");
+        // Q=1 25-ft steps: 38000 lands exactly on a step, so the round-trip
+        // must be byte-exact -- no tolerance needed. Any tolerance here would
+        // let the /0.3048 regression sneak back in (which returns ~11582).
+        assertEquals(truthAltFt, last.altitudeFt(),
+                "altitude must round-trip in FEET; if this reads ~11582 the"
+                        + " adapter is dividing feet by 0.3048 again");
+        // Also pin the geometric flag: TC 9-18 = barometric, so isGeometric
+        // must be false today. Flip this assertion when TC 20-22 support
+        // (issue #6) lands and the adapter starts distinguishing.
+        assertFalse(last.isGeometric(),
+                "TC 9-18 airborne position is barometric; adapter must not"
+                        + " flag it as GNSS geometric until issue #6 lands");
+    }
+
+    @Test
+    void airborne_position_altitude_various_25ft_values_all_round_trip() {
+        // Sweep across the Q=1 25-ft-increment range to catch any
+        // sign/off-by-one/mask bug in the encoder OR the decoder path.
+        // Values chosen: sea level, GA cruise, jet cruise, RVSM top,
+        // U-2 territory. All are exact multiples of 25 ft in the
+        // (alt+1000)/25 encoding, so round-trip is byte-exact.
+        int[] truthAltsFt = { 0, 2500, 12500, 35000, 41000, 50000 };
+        for (int truthAltFt : truthAltsFt) {
+            OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+            AdsbFrame.AirbornePosition last = null;
+            for (int i = 0; i < 4; i++) {
+                AdsbFrame f0 = a.decode(encodePosWithAlt("ABCDEF", 49.98, 8.55, 0, truthAltFt));
+                AdsbFrame f1 = a.decode(encodePosWithAlt("ABCDEF", 49.98, 8.55, 1, truthAltFt));
+                if (f0 instanceof AdsbFrame.AirbornePosition p) last = p;
+                if (f1 instanceof AdsbFrame.AirbornePosition p) last = p;
+            }
+            assertNotNull(last,
+                    "AirbornePosition must emerge for altitude " + truthAltFt + " ft");
+            assertEquals(truthAltFt, last.altitudeFt(),
+                    "altitude " + truthAltFt + " ft must round-trip exactly"
+                            + " (got " + last.altitudeFt() + " -- likely /0.3048 regression)");
+        }
+    }
+
+    @Test
     void evict_removes_position_decoder() {
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
         a.decode(encodeAirbornePosition("40621D", 49.98, 8.55, 0));
@@ -138,8 +204,27 @@ class OpenSkyFrameAdapterTest {
     // synthesise known-truth frames for round-trip testing.
     // ------------------------------------------------------------------
 
-    /** Encode a DF17 airborne baro-position frame (TC=11, alt=38000ft) at the given truth position. */
+    /** Encode a DF17 airborne baro-position frame (TC=11) with the AC field zeroed. */
     private static String encodeAirbornePosition(String icaoHex, double lat, double lon, int F) {
+        return encodePosWithAlt(icaoHex, lat, lon, F, /* zero altcode */ Integer.MIN_VALUE);
+    }
+
+    /**
+     * Encode a DF17 TC 11 airborne baro-position frame with an explicit
+     * altitude in feet, using the DO-260B Q=1 25-ft-increment encoding.
+     * Pass {@link Integer#MIN_VALUE} to leave the AC field zeroed (matches
+     * the pre-existing tests that don't care about altitude).
+     *
+     * <p>Q=1 encoding per DO-260B / Doc 9871 App. C:
+     * <pre>
+     *   N        = (alt_ft + 1000) / 25
+     *   AC[11:0] = N[10:5] Q N[4:0]     (Q=1 in bit 4)
+     * </pre>
+     * Altitudes outside a Q=1-representable range fall back to a zeroed
+     * AC field so tests can still exercise the frame-shape paths.
+     */
+    private static String encodePosWithAlt(String icaoHex, double lat, double lon,
+                                            int F, int altFt) {
         int tc = 11;
 
         double dLat = (F == 0) ? 360.0 / 60.0 : 360.0 / 59.0;
@@ -150,6 +235,28 @@ class OpenSkyFrameAdapterTest {
         double dLon = 360.0 / n;
         int xz = (int) Math.floor(131072.0 * modPos(lon, dLon) / dLon + 0.5) & 0x1FFFF;
 
+        // Q=1 AC field. Valid range: N in [1, 2047] -> alt in [-975, +50175] ft.
+        int ac = 0;
+        if (altFt != Integer.MIN_VALUE) {
+            int nCode = (altFt + 1000) / 25;
+            if (nCode < 1 || nCode > 2047 || (nCode * 25 - 1000) != altFt) {
+                // Non-representable in Q=1 25-ft steps; encoder deliberately
+                // does not support Q=0 gray-code -- pick a Q=1-friendly test value.
+                throw new IllegalArgumentException(
+                        "altitude " + altFt + " ft not representable in Q=1 25-ft encoding");
+            }
+            // OpenSky decodes with N = (AC & 0xF) | ((AC & 0xFE0) >>> 1),
+            // which recovers an 11-bit N by concatenating AC[3:0] (low 4) with
+            // AC[11:5] (top 7, shifted right by 1 to skip the Q bit at AC[4]).
+            // Inverse: keep N[3:0] in AC[3:0], shift N[10:4] up by 1 to sit at
+            // AC[11:5], and set Q=1 at AC[4]. Verified by round-trip for
+            // 0/2500/5000/12500/35000/38000/41000/50000 ft against OpenSky's
+            // exact decoder formula.
+            int acLo = nCode & 0x00F;         // N[3:0] -> AC[3:0]
+            int acHi = (nCode & 0x7F0) << 1;  // N[10:4] -> AC[11:5] (skip Q at bit 4)
+            ac = (acHi | 0x10 | acLo) & 0xFFF;
+        }
+
         // ME (56 bits) layout for airborne baro position (v0):
         //   [55:51] TC(5) [50:49] SS(2) [48] NIC-SB [47:36] AltCode(12) [35] T [34] F
         //   [33:17] CPRlat(17) [16:0] CPRlon(17)
@@ -157,7 +264,7 @@ class OpenSkyFrameAdapterTest {
         me |= ((long)(tc & 0x1F)) << 51;
         me |= 0L << 49;                   // SS = 0
         me |= 0L << 48;                   // NIC-SB
-        me |= 0L << 36;                   // altcode zeroed (test doesn't care about altitude)
+        me |= ((long)(ac & 0xFFF)) << 36; // 12-bit AC field
         me |= 0L << 35;                   // T
         me |= ((long)(F & 1)) << 34;
         me |= ((long)(yz & 0x1FFFF)) << 17;
