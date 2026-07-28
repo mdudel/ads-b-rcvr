@@ -25,10 +25,12 @@ import java.util.UUID;
  *       e.g. {@code tcp/localhost:7447;adsb/cot}. Endpoint is any scheme
  *       the pure-Java Zenoh facade accepts (tcp / tls / ws / wss);
  *       key-prefix is the base Zenoh key expression the sink publishes
- *       under. Per-frame keys are derived per-payload by
- *       {@link com.adsb.transport.ZenohForwarder} — CoT XML gets a
- *       per-aircraft sub-key of ICAO24, AVR/JSON go to the base key.</li>
+ *       under. See {@link #zenohMode} for the per-frame key layout.</li>
  * </ul>
+ *
+ * <p>{@link #zenohMode} is meaningful only for {@link Type#ZENOH}
+ * connectors but is persisted on every record for schema simplicity.
+ * Other types read/write the field but ignore it at attach time.
  */
 public record Connector(
         /** Stable UUID. Never mutated across edits so persistence keys stay valid. */
@@ -46,6 +48,14 @@ public record Connector(
         /** Payload format. Same enum the CLI --payload flag uses. */
         PayloadFormat payload,
 
+        /**
+         * Zenoh key-layout mode. Meaningful only for {@link Type#ZENOH};
+         * ignored (but persisted) for other types. Never null — the
+         * canonical ctor coerces null to {@link ZenohMode#PER_AIRCRAFT}
+         * to preserve the pre-{@code ZenohMode} shipping default.
+         */
+        ZenohMode zenohMode,
+
         /** {@code true} = attach at startup / on save; {@code false} = keep in the list but don't attach. */
         boolean enabled
 ) {
@@ -55,17 +65,38 @@ public record Connector(
         Objects.requireNonNull(type,    "type");
         Objects.requireNonNull(target,  "target");
         Objects.requireNonNull(payload, "payload");
+        if (zenohMode == null) zenohMode = ZenohMode.PER_AIRCRAFT;
     }
 
-    /** @return a fresh connector with a new UUID id. */
+    /**
+     * Convenience factory for a fresh connector; uses
+     * {@link ZenohMode#PER_AIRCRAFT} as the Zenoh mode default so
+     * legacy call sites don't need to pass one explicitly.
+     */
     public static Connector newInstance(String name, Type type, String target,
                                         PayloadFormat payload, boolean enabled) {
+        return newInstance(name, type, target, payload, ZenohMode.PER_AIRCRAFT, enabled);
+    }
+
+    /** Full-arg factory: fresh UUID + operator-chosen Zenoh mode. */
+    public static Connector newInstance(String name, Type type, String target,
+                                        PayloadFormat payload, ZenohMode zenohMode,
+                                        boolean enabled) {
         return new Connector(UUID.randomUUID().toString(),
-                name, type, target, payload, enabled);
+                name, type, target, payload, zenohMode, enabled);
     }
 
     public Connector withEnabled(boolean e) {
-        return new Connector(id, name, type, target, payload, e);
+        return new Connector(id, name, type, target, payload, zenohMode, e);
+    }
+
+    /**
+     * @return a new record with {@link #zenohMode} replaced; leaves
+     *         every other field untouched (id stable, so the sink
+     *         registry keeps its handle).
+     */
+    public Connector withZenohMode(ZenohMode m) {
+        return new Connector(id, name, type, target, payload, m, enabled);
     }
 
     /** Types the UI offers. All types are wire-implemented as of the Zenoh landing under #4. */

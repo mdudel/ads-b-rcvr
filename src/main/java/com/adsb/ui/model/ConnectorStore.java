@@ -101,6 +101,12 @@ public final class ConnectorStore {
             p.setProperty(base + "type",    c.type().name());
             p.setProperty(base + "target",  c.target());
             p.setProperty(base + "payload", c.payload().name());
+            // zenohMode is meaningful only for ZENOH connectors but is
+            // persisted on every record for schema simplicity. Backwards
+            // compat: files written before this field existed load with
+            // ZenohMode.PER_AIRCRAFT (matches the pre-mode shipping
+            // default; see ZenohMode.parseOrDefault javadoc).
+            p.setProperty(base + "zenohMode", c.zenohMode().name());
             p.setProperty(base + "enabled", Boolean.toString(c.enabled()));
         }
         Path tmp = file.resolveSibling(file.getFileName().toString() + ".tmp");
@@ -185,6 +191,7 @@ public final class ConnectorStore {
         String typeStr = m.get("type");
         String target  = m.get("target");
         String payStr  = m.get("payload");
+        String modeStr = m.get("zenohMode");   // may be absent on pre-mode files
         String enabled = m.get("enabled");
         if (name == null || typeStr == null || target == null || payStr == null) return null;
         try {
@@ -192,6 +199,7 @@ public final class ConnectorStore {
                     Connector.Type.valueOf(typeStr),
                     target,
                     PayloadFormat.valueOf(payStr),
+                    ZenohMode.parseOrDefault(modeStr),   // null/unknown -> PER_AIRCRAFT
                     Boolean.parseBoolean(enabled == null ? "false" : enabled));
         } catch (IllegalArgumentException e) {
             System.err.println("[connector-store] skipping malformed connector id=" + id + ": " + e);

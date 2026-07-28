@@ -1,6 +1,7 @@
 package com.adsb.transport;
 
 import com.adsb.core.FrameForwarder;
+import com.adsb.ui.model.ZenohMode;
 
 import io.mdudel.zenoh.purejava.PureJavaZenohPublisher;
 
@@ -14,21 +15,30 @@ import java.util.regex.Pattern;
  * on a key derived from the payload contents.
  *
  * <h2>Key expression layout</h2>
+ *
+ * <p>Controlled by the {@link ZenohMode} passed at construction:
+ *
  * <ul>
- *   <li><b>CoT XML</b> (payload contains {@code uid="ICAO-XXXXXX"}): publishes
- *       to {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;} so Zenoh subscribers can
- *       select a single aircraft with {@code adsb/cot/4CA1FA} or the whole
- *       fleet with {@code adsb/cot/**}.</li>
- *   <li><b>Everything else</b> (AVR line, JSON blob, raw bytes without an
- *       obvious ICAO tag): publishes to the base {@code keyPrefix} as-is.
- *       Downstream subscribers get a firehose on that one key.</li>
+ *   <li>{@link ZenohMode#STREAM}: every frame publishes to the base
+ *       {@code keyPrefix} as-is. All payloads (CoT, JSON, AVR) land on
+ *       one topic. Best for downstream consumers that want the whole
+ *       feed as a single stream and will dispatch / filter themselves.</li>
+ *   <li>{@link ZenohMode#PER_AIRCRAFT}: CoT XML with a
+ *       {@code uid="ICAO-XXXXXX"} attribute publishes to
+ *       {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;} so Zenoh subscribers can
+ *       select a single aircraft with {@code adsb/cot/4CA1FA} or the
+ *       whole fleet with {@code adsb/cot/**}. Non-CoT payloads (AVR /
+ *       JSON / bytes without a recognisable {@code uid}) still land on
+ *       the base key because there's no reliable per-entity key to
+ *       derive.</li>
  * </ul>
  *
- * <p>The per-aircraft key split for CoT is idiomatic Zenoh — one topic per
+ * <p>The per-aircraft split for CoT is idiomatic Zenoh — one topic per
  * addressable thing — and matches the pattern established by the reference
  * MQTT/CoT bridges (adsbcot, Flinterpop/ADSBtoCOT). It costs nothing at the
  * publisher side (single {@code IndexOf}/regex per frame) and enables cheap
- * subscriber-side filtering by tail-key.
+ * subscriber-side filtering by tail-key. But it's not always what an
+ * operator wants — hence the mode toggle exposed on every Zenoh connector.
  *
  * <h2>Endpoint</h2>
  * <p>Passed straight through to
@@ -77,6 +87,7 @@ public final class ZenohForwarder implements FrameForwarder {
 
     private final PureJavaZenohPublisher publisher;
     private final String keyPrefix;
+    private final ZenohMode mode;
     private volatile boolean closed = false;
 
     /**
@@ -90,12 +101,13 @@ public final class ZenohForwarder implements FrameForwarder {
      * @throws IOException if the endpoint is malformed, the router is
      *                     unreachable, or the Zenoh handshake fails.
      */
-    public ZenohForwarder(String endpoint, String keyPrefix) throws IOException {
+    public ZenohForwarder(String endpoint, String keyPrefix, ZenohMode mode) throws IOException {
         if (endpoint == null || endpoint.isBlank())
             throw new IOException("Zenoh endpoint is required");
         if (keyPrefix == null || keyPrefix.isBlank())
             throw new IOException("Zenoh key prefix is required");
         this.keyPrefix = trimSlashes(keyPrefix);
+        this.mode = (mode == null) ? ZenohMode.PER_AIRCRAFT : mode;
         // Bind the base key at build time; per-frame sub-keys are appended
         // via publish(subKey, bytes). The facade concatenates
         // effectiveKeyExpr + "/" + subKey internally.
@@ -107,12 +119,27 @@ public final class ZenohForwarder implements FrameForwarder {
     }
 
     /**
-     * Publish one frame. Derives the Zenoh sub-key from the payload:
+     * Convenience overload defaulting to {@link ZenohMode#PER_AIRCRAFT} —
+     * matches the pre-mode shipping behaviour (commit {@code 8e4aca2}).
+     * Preserved so any downstream caller wired against the 2-arg ctor
+     * before the mode field landed keeps compiling. Intentionally does
+     * NOT auto-detect stream vs per-aircraft — the choice is an
+     * operator decision, not a heuristic.
+     */
+    public ZenohForwarder(String endpoint, String keyPrefix) throws IOException {
+        this(endpoint, keyPrefix, ZenohMode.PER_AIRCRAFT);
+    }
+
+    /**
+     * Publish one frame. Sub-key selection follows the {@link ZenohMode}
+     * chosen at construction:
      * <ul>
-     *   <li>CoT XML with a {@code uid="ICAO-XXXXXX"} attribute → sub-key is
-     *       the ICAO hex, so the effective published key is
-     *       {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;}.</li>
-     *   <li>Anything else → published to the base {@code keyPrefix}.</li>
+     *   <li>{@link ZenohMode#STREAM}: always publishes to the base
+     *       {@code keyPrefix}, regardless of payload contents.</li>
+     *   <li>{@link ZenohMode#PER_AIRCRAFT}: CoT XML with a
+     *       {@code uid="ICAO-XXXXXX"} attribute publishes to
+     *       {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;}; anything else publishes
+     *       to the base {@code keyPrefix}.</li>
      * </ul>
      *
      * <p>Payload bytes are published verbatim; no re-encoding. Zenoh
@@ -123,8 +150,33 @@ public final class ZenohForwarder implements FrameForwarder {
     public void forward(byte[] frame) throws Exception {
         if (closed) throw new IOException("ZenohForwarder is closed");
         if (frame == null || frame.length == 0) return;
-        String subKey = extractIcaoHex(frame);
+        String subKey = selectSubKey(frame, mode);
         publisher.publish(subKey, frame);
+    }
+
+    /**
+     * Compute the Zenoh sub-key for one frame under the given mode.
+     * Pulled out of {@link #forward(byte[])} so tests can pin the
+     * decision table hermetically (a live Zenoh router isn't available
+     * in the sandbox but the sub-key choice is pure data).
+     *
+     * <ul>
+     *   <li>{@link ZenohMode#STREAM}: always {@code null} (publish to
+     *       the base key).</li>
+     *   <li>{@link ZenohMode#PER_AIRCRAFT} or {@code null}: delegate to
+     *       {@link #extractIcaoHex} and let it decide (returns ICAO for
+     *       CoT, {@code null} for anything else).</li>
+     * </ul>
+     *
+     * <p>A {@code null} mode is treated as PER_AIRCRAFT to match the
+     * ctor coercion contract; the ctor itself already normalises before
+     * any {@link #forward} call, so production never actually exercises
+     * the null branch, but the invariant is pinned in tests so nobody
+     * accidentally makes this method NPE later.
+     */
+    static String selectSubKey(byte[] frame, ZenohMode mode) {
+        if (mode == ZenohMode.STREAM) return null;
+        return extractIcaoHex(frame);
     }
 
     /**
@@ -164,6 +216,11 @@ public final class ZenohForwarder implements FrameForwarder {
     /** @return the trimmed key prefix this sink publishes under. Test hook. */
     String keyPrefix() {
         return keyPrefix;
+    }
+
+    /** @return the key-layout mode this sink was constructed with. Test hook. */
+    ZenohMode mode() {
+        return mode;
     }
 
     /**

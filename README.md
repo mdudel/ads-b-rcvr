@@ -329,18 +329,37 @@ endpoint;key-prefix
 - **key-prefix** — base Zenoh key expression, e.g. `adsb/cot`. Leading
   and trailing slashes are trimmed.
 
-### Emitted key expression per payload
+### Mode: stream vs per-aircraft
 
-| Payload | Emitted key                          | Notes                                     |
-|---------|--------------------------------------|-------------------------------------------|
-| CoT     | `<key-prefix>/<ICAO24>`              | Per-aircraft sub-key derived from `uid`   |
-| JSON    | `<key-prefix>`                       | Firehose on the base key                  |
-| AVR     | `<key-prefix>`                       | Firehose on the base key                  |
+Every Zenoh connector picks a **mode** (dropdown on the Add / Edit
+form, persisted as `connector.<id>.zenohMode`):
 
-Example: with target `tcp/localhost:7447;adsb/cot`, an aircraft with
-ICAO `4CA1FA` publishes to key `adsb/cot/4CA1FA`. Subscribe to one
-aircraft with `adsb/cot/4CA1FA` or the whole fleet with
-`adsb/cot/**`.
+- **Stream (one topic)** — every frame publishes to the base key
+  prefix as-is, regardless of payload. All CoT / JSON / AVR lands on
+  one topic. Best for downstream consumers that want the whole feed
+  as a single stream and will filter themselves.
+- **Per aircraft (fan out)** — CoT frames publish to a per-aircraft
+  sub-key derived from the `uid="ICAO-XXXXXX"` attribute. Non-CoT
+  payloads (JSON / AVR) still land on the base key because there's no
+  reliable per-entity key to derive.
+
+Backward compat: connectors saved before this option existed load
+as **Per aircraft** (the pre-option shipping default).
+
+### Emitted key expression per (payload, mode) pair
+
+| Payload | Mode         | Emitted key                    |
+|---------|--------------|--------------------------------|
+| CoT     | Per aircraft | `<key-prefix>/<ICAO24>`        |
+| CoT     | Stream       | `<key-prefix>`                 |
+| JSON    | either       | `<key-prefix>`                 |
+| AVR     | either       | `<key-prefix>`                 |
+
+Example: with target `tcp/localhost:7447;adsb/cot` and mode
+**Per aircraft**, an aircraft with ICAO `4CA1FA` publishes to key
+`adsb/cot/4CA1FA`. Subscribe to one aircraft with `adsb/cot/4CA1FA`
+or the whole fleet with `adsb/cot/**`. With mode **Stream**, every
+frame lands on `adsb/cot` regardless.
 
 ### Smoke recipe against a local zenohd
 

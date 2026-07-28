@@ -92,6 +92,80 @@ class ConnectorStoreTest {
     }
 
     @Test
+    void zenoh_mode_round_trips_through_save_and_load(@TempDir Path dir) throws Exception {
+        Path f = dir.resolve("mode.properties");
+        ConnectorStore a = new ConnectorStore(f);
+
+        Connector stream = Connector.newInstance("Zenoh Stream",
+                Connector.Type.ZENOH,
+                "tcp/localhost:7447;adsb",
+                PayloadFormat.COT,
+                ZenohMode.STREAM,
+                true);
+        Connector fanout = Connector.newInstance("Zenoh Fan-out",
+                Connector.Type.ZENOH,
+                "tcp/localhost:7447;adsb/cot",
+                PayloadFormat.COT,
+                ZenohMode.PER_AIRCRAFT,
+                true);
+        a.add(stream);
+        a.add(fanout);
+        a.save();
+
+        ConnectorStore b = new ConnectorStore(f);
+        b.load();
+        assertEquals(ZenohMode.STREAM,       b.get(stream.id()).zenohMode(),
+                "STREAM mode must survive save/load round-trip");
+        assertEquals(ZenohMode.PER_AIRCRAFT, b.get(fanout.id()).zenohMode(),
+                "PER_AIRCRAFT mode must survive save/load round-trip");
+    }
+
+    @Test
+    void pre_mode_properties_file_loads_with_per_aircraft_default(@TempDir Path dir) throws Exception {
+        // A properties file written by commit 8e4aca2 (initial Zenoh sink,
+        // before ZenohMode was persisted) has no connector.<id>.zenohMode key.
+        // Loader must default to PER_AIRCRAFT so the operator's shipping
+        // behaviour is preserved without any manual migration.
+        Path f = dir.resolve("pre-mode.properties");
+        java.nio.file.Files.writeString(f, String.join("\n",
+                "connector.abc.name=Legacy Zenoh",
+                "connector.abc.type=ZENOH",
+                "connector.abc.target=tcp/localhost:7447;adsb/cot",
+                "connector.abc.payload=COT",
+                // deliberately NO zenohMode key
+                "connector.abc.enabled=true",
+                ""));
+        ConnectorStore s = new ConnectorStore(f);
+        s.load();
+        Connector c = s.get("abc");
+        assertNotNull(c, "pre-mode connector must load, not be dropped");
+        assertEquals(ZenohMode.PER_AIRCRAFT, c.zenohMode(),
+                "missing zenohMode property must default to PER_AIRCRAFT for backward compat");
+    }
+
+    @Test
+    void unknown_zenoh_mode_string_falls_back_to_per_aircraft(@TempDir Path dir) throws Exception {
+        // A future rename or a hand-edited file might contain an unknown
+        // enum name. Loader must not throw or drop the record -- fall
+        // back to PER_AIRCRAFT so the connector is still usable.
+        Path f = dir.resolve("unknown-mode.properties");
+        java.nio.file.Files.writeString(f, String.join("\n",
+                "connector.abc.name=Hand-edited Zenoh",
+                "connector.abc.type=ZENOH",
+                "connector.abc.target=tcp/localhost:7447;adsb/cot",
+                "connector.abc.payload=COT",
+                "connector.abc.zenohMode=SOMETHING_WEIRD",
+                "connector.abc.enabled=true",
+                ""));
+        ConnectorStore s = new ConnectorStore(f);
+        s.load();
+        Connector c = s.get("abc");
+        assertNotNull(c);
+        assertEquals(ZenohMode.PER_AIRCRAFT, c.zenohMode(),
+                "unknown zenohMode enum name must fall back to PER_AIRCRAFT");
+    }
+
+    @Test
     void malformed_property_lines_are_skipped_not_thrown(@TempDir Path dir) throws Exception {
         Path f = dir.resolve("mixed.properties");
         java.nio.file.Files.writeString(f, String.join("\n",

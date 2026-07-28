@@ -147,7 +147,10 @@ public final class ConnectorAttacher {
                 // slashes (well-formed Zenoh key expressions do) but not
                 // semicolons (which aren't valid in Zenoh keys anyway).
                 String[] ek = splitEndpointAndKey(target, "Zenoh target");
-                return new ZenohForwarder(ek[0], ek[1]);
+                // ZenohMode is a first-class Connector field, not part of
+                // the target string. Null-safe because the Connector
+                // canonical ctor coerces null to PER_AIRCRAFT.
+                return new ZenohForwarder(ek[0], ek[1], c.zenohMode());
             }
             default:
                 throw new IllegalArgumentException("unknown connector type: " + c.type());

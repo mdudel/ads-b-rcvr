@@ -1,5 +1,6 @@
 package com.adsb.transport;
 
+import com.adsb.ui.model.ZenohMode;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -130,5 +131,61 @@ class ZenohForwarderTest {
         // this as a documented pin so a future rewrite that adds a
         // hard null-check knows it was deliberate to allow it.
         assertNull(ZenohForwarder.extractIcaoHex(new byte[0]));
+    }
+
+    // ------------------------------------------------------------------
+    // Mode-branch tests: we can't stand up a live Zenoh session in the
+    // sandbox, but the sub-key selection is pure and can be tested
+    // through a package-private helper that mirrors forward()'s branch.
+    // The test doesn't need a live publisher because the choice of key
+    // is decided BEFORE the publish call. Pin the branch table so a
+    // future edit to forward() that flips the mode semantics is caught.
+    // ------------------------------------------------------------------
+
+    @Test
+    void stream_mode_always_publishes_to_base_key_regardless_of_payload() {
+        // CoT payload with a valid ICAO uid -- PER_AIRCRAFT would fan out,
+        // but STREAM must ignore the uid and stay on the base key.
+        byte[] cot = "<event uid=\"ICAO-4CA1FA\"/>".getBytes(StandardCharsets.UTF_8);
+        assertNull(ZenohForwarder.selectSubKey(cot, ZenohMode.STREAM),
+                "STREAM mode must publish CoT to the base key; got a sub-key -- "
+                        + "the mode toggle in forward() is not honouring STREAM");
+
+        byte[] json = "{\"icao\":\"4CA1FA\"}".getBytes(StandardCharsets.UTF_8);
+        assertNull(ZenohForwarder.selectSubKey(json, ZenohMode.STREAM));
+
+        byte[] avr = "*8D4CA1FA202CC371C32CE0576098;".getBytes(StandardCharsets.UTF_8);
+        assertNull(ZenohForwarder.selectSubKey(avr, ZenohMode.STREAM));
+    }
+
+    @Test
+    void per_aircraft_mode_derives_icao_subkey_from_cot_payload() {
+        byte[] cot = "<event uid=\"ICAO-4CA1FA\"/>".getBytes(StandardCharsets.UTF_8);
+        assertEquals("4CA1FA", ZenohForwarder.selectSubKey(cot, ZenohMode.PER_AIRCRAFT),
+                "PER_AIRCRAFT mode must derive the ICAO sub-key from CoT uid");
+    }
+
+    @Test
+    void per_aircraft_mode_falls_back_to_base_key_for_non_cot_payloads() {
+        // AVR and JSON have no uid; PER_AIRCRAFT must NOT invent one.
+        byte[] avr = "*8D4CA1FA202CC371C32CE0576098;".getBytes(StandardCharsets.UTF_8);
+        assertNull(ZenohForwarder.selectSubKey(avr, ZenohMode.PER_AIRCRAFT),
+                "PER_AIRCRAFT with a non-CoT payload must fall back to the base key");
+
+        byte[] json = "{\"icao\":\"4CA1FA\"}".getBytes(StandardCharsets.UTF_8);
+        assertNull(ZenohForwarder.selectSubKey(json, ZenohMode.PER_AIRCRAFT),
+                "JSON payloads have no uid; PER_AIRCRAFT must NOT peek into them");
+    }
+
+    @Test
+    void null_mode_selects_as_per_aircraft() {
+        // Defensive: the ctor coerces null to PER_AIRCRAFT before any
+        // forward() call, so production never sees a null mode here.
+        // But selectSubKey() is package-private and callable from other
+        // code paths in the future; pin the null branch so nobody
+        // accidentally NPEs it later.
+        byte[] cot = "<event uid=\"ICAO-4CA1FA\"/>".getBytes(StandardCharsets.UTF_8);
+        assertEquals("4CA1FA", ZenohForwarder.selectSubKey(cot, null),
+                "null mode should behave as PER_AIRCRAFT -- matches ctor coercion contract");
     }
 }

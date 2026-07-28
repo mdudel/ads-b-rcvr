@@ -4,6 +4,7 @@ import com.adsb.core.PayloadFormat;
 import com.adsb.ui.model.Connector;
 import com.adsb.ui.model.ConnectorAttacher;
 import com.adsb.ui.model.ConnectorStore;
+import com.adsb.ui.model.ZenohMode;
 
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -191,10 +192,18 @@ public final class ConnectorsPanel extends JPanel {
             super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
             if (value instanceof Connector c) {
                 String status = c.enabled() ? "\u25cf" : "\u25cb";
+                // Show the Zenoh mode inline on Zenoh rows so the
+                // operator can tell stream-vs-fan-out apart at a glance.
+                // Suppressed for other types where the field is dead weight.
+                String zenohHint = (c.type() == Connector.Type.ZENOH)
+                        ? "&nbsp;&nbsp;<i>" + c.zenohMode().label() + "</i>"
+                        : "";
                 setText("<html><b>" + status + " " + escape(c.name()) + "</b>"
                         + "<br><small>" + c.type().label()
                         + " \u2192 " + escape(c.target())
-                        + "&nbsp;&nbsp;[" + c.payload() + "]</small></html>");
+                        + "&nbsp;&nbsp;[" + c.payload() + "]"
+                        + zenohHint
+                        + "</small></html>");
             }
             return this;
         }
@@ -229,6 +238,23 @@ public final class ConnectorsPanel extends JPanel {
             JTextField targetField  = new JTextField(existing == null ? "" : existing.target(), 20);
             JComboBox<PayloadFormat> payBox = new JComboBox<>(PayloadFormat.values());
             if (existing != null) payBox.setSelectedItem(existing.payload());
+
+            // Zenoh-only field: key-layout mode. Rendered on every form so
+            // the layout is stable across type changes, but enabled only
+            // for ZENOH; the operator gets a visual cue that the mode
+            // is a Zenoh property, not a global one.
+            JComboBox<ZenohMode> zenohModeBox = new JComboBox<>(ZenohMode.values());
+            zenohModeBox.setRenderer(new DefaultListCellRenderer() {
+                @Override public Component getListCellRendererComponent(
+                        JList<?> l, Object v, int i, boolean sel, boolean focus) {
+                    super.getListCellRendererComponent(l, v, i, sel, focus);
+                    if (v instanceof ZenohMode m) setText(m.label());
+                    return this;
+                }
+            });
+            zenohModeBox.setSelectedItem(
+                    existing == null ? ZenohMode.PER_AIRCRAFT : existing.zenohMode());
+
             JCheckBox enabledBox = new JCheckBox("Enabled",
                     existing == null || existing.enabled());
 
@@ -247,6 +273,21 @@ public final class ConnectorsPanel extends JPanel {
             typeBox.addActionListener(e -> syncHint.run());
             syncHint.run();
 
+            // Zenoh mode row is only meaningful when type == ZENOH. Kept
+            // visible always so the form geometry is stable, but disabled
+            // (grayed) when the selected type doesn't use it. Same UX
+            // convention as the OK button's isImplemented() gating.
+            Runnable syncModeEnabled = () -> {
+                Connector.Type t = (Connector.Type) typeBox.getSelectedItem();
+                boolean isZenoh = (t == Connector.Type.ZENOH);
+                zenohModeBox.setEnabled(isZenoh);
+                zenohModeBox.setToolTipText(isZenoh
+                        ? "Stream = one topic for everything; Per aircraft = separate topic per ICAO for CoT"
+                        : "Zenoh-only setting; ignored for " + t.label());
+            };
+            typeBox.addActionListener(e -> syncModeEnabled.run());
+            syncModeEnabled.run();
+
             JPanel form = new JPanel(new GridBagLayout());
             form.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
             GridBagConstraints gc = new GridBagConstraints();
@@ -263,6 +304,8 @@ public final class ConnectorsPanel extends JPanel {
             gc.gridx = 1; gc.gridy++;             form.add(targetHint,  gc);
             gc.gridx = 0; gc.gridy++;
             form.add(new JLabel("Payload:"), gc); gc.gridx = 1; form.add(payBox,      gc);
+            gc.gridx = 0; gc.gridy++;
+            form.add(new JLabel("Zenoh mode:"), gc); gc.gridx = 1; form.add(zenohModeBox, gc);
             gc.gridx = 1; gc.gridy++;             form.add(enabledBox,  gc);
 
             // Custom dialog so we can gate OK on type.isImplemented().
@@ -300,12 +343,13 @@ public final class ConnectorsPanel extends JPanel {
             Connector.Type type    = (Connector.Type) typeBox.getSelectedItem();
             String target  = targetField.getText().trim();
             PayloadFormat pay = (PayloadFormat) payBox.getSelectedItem();
+            ZenohMode mode = (ZenohMode) zenohModeBox.getSelectedItem();
             boolean enabled = enabledBox.isSelected();
 
             if (existing == null) {
-                return Connector.newInstance(name, type, target, pay, enabled);
+                return Connector.newInstance(name, type, target, pay, mode, enabled);
             }
-            return new Connector(existing.id(), name, type, target, pay, enabled);
+            return new Connector(existing.id(), name, type, target, pay, mode, enabled);
         }
 
         /** Walk the pane to find its OK/Cancel buttons so we can enable/disable OK. */
