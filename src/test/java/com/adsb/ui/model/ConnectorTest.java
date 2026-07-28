@@ -28,12 +28,23 @@ class ConnectorTest {
     }
 
     @Test
-    void zenoh_is_present_but_flagged_not_implemented() {
-        assertTrue(Connector.Type.UDP_UNICAST.isImplemented());
-        assertTrue(Connector.Type.UDP_MULTICAST.isImplemented());
-        assertTrue(Connector.Type.TCP_SERVER.isImplemented());
-        assertFalse(Connector.Type.ZENOH.isImplemented());
-        assertTrue(Connector.Type.ZENOH.label().toLowerCase().contains("zenoh"));
+    void every_type_is_implemented_and_has_a_label() {
+        // Post-#4 (Zenoh wiring): every dropdown type is wire-implemented.
+        // The isImplemented() predicate is retained so a future scaffolded-
+        // but-unwired type can rejoin the dropdown grayed-out without
+        // another round of surgery, but today all four return true.
+        for (Connector.Type t : Connector.Type.values()) {
+            assertTrue(t.isImplemented(),
+                    "type " + t + " should be implemented after #4 lands");
+            assertNotNull(t.label(),
+                    "type " + t + " must have a display label");
+            assertFalse(t.label().isBlank(),
+                    "type " + t + " label must not be blank");
+        }
+        // Zenoh label should not still advertise "coming soon" -- the
+        // dropdown gates ATTACH on isImplemented, but users read the label.
+        assertFalse(Connector.Type.ZENOH.label().toLowerCase().contains("coming"),
+                "post-#4 the Zenoh label should be plain 'Zenoh', not 'coming soon'");
     }
 
     @Test

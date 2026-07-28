@@ -310,6 +310,73 @@ Consequences a WinTAK/ATAK operator will notice:
 
 ---
 
+## Publishing to Zenoh
+
+The **Zenoh** connector type publishes each forwarded frame to a
+[Zenoh](https://zenoh.io) router as a PUSH message. Zero external
+dependencies — the receiver ships a vendored pure-Java Zenoh 1.x
+client (no JNI, no native libraries).
+
+### Connector target format
+
+```
+endpoint;key-prefix
+```
+
+- **endpoint** — any scheme the pure-Java facade accepts:
+  `tcp/host:port`, `tls/host:port`, `ws/host:port`, `wss/host:port`.
+  Example: `tcp/localhost:7447`.
+- **key-prefix** — base Zenoh key expression, e.g. `adsb/cot`. Leading
+  and trailing slashes are trimmed.
+
+### Emitted key expression per payload
+
+| Payload | Emitted key                          | Notes                                     |
+|---------|--------------------------------------|-------------------------------------------|
+| CoT     | `<key-prefix>/<ICAO24>`              | Per-aircraft sub-key derived from `uid`   |
+| JSON    | `<key-prefix>`                       | Firehose on the base key                  |
+| AVR     | `<key-prefix>`                       | Firehose on the base key                  |
+
+Example: with target `tcp/localhost:7447;adsb/cot`, an aircraft with
+ICAO `4CA1FA` publishes to key `adsb/cot/4CA1FA`. Subscribe to one
+aircraft with `adsb/cot/4CA1FA` or the whole fleet with
+`adsb/cot/**`.
+
+### Smoke recipe against a local zenohd
+
+1. Start a Zenoh router on your box (any recent `zenohd` release):
+   ```bash
+   zenohd --listen tcp/0.0.0.0:7447 --listen tcp/[::]:7447
+   ```
+   The double `--listen` is important on Windows — the default
+   `tcp/[::]:7447` alone does NOT dual-bind to IPv4 and
+   `localhost` typically resolves to `127.0.0.1` first.
+
+2. Start a subscriber in another shell (using any Zenoh client;
+   `zenoh-cli` shown here):
+   ```bash
+   z_sub -k 'adsb/cot/**'
+   ```
+
+3. In the ADS-B receiver UI, add a Zenoh connector:
+   - Name: `Ops Zenoh`
+   - Type: `Zenoh`
+   - Target: `tcp/localhost:7447;adsb/cot`
+   - Payload: `CoT XML`
+   - Enabled: yes
+
+4. Watch aircraft snapshots flow through the subscriber, one
+   `adsb/cot/<ICAO>` per aircraft update.
+
+### Windows localhost gotcha
+
+If you get `Connection refused: getsockopt`, either start `zenohd`
+with both `tcp/0.0.0.0:7447` **and** `tcp/[::]:7447` (as above), or
+change the connector target to `tcp/[::1]:7447;adsb/cot` to force
+IPv6 loopback.
+
+---
+
 ## Receiving Multicast — Java snippet
 
 ```java
@@ -374,10 +441,11 @@ Key packages:
 | Package | Purpose |
 |---------|---------|
 | `com.adsb.core`     | Receiver process, forwarder interface, `--payload` enum, `OpenSkyFrameAdapter` bridge |
-| `com.adsb.transport`| UDP unicast / multicast / TCP fan-out sinks |
+| `com.adsb.transport`| UDP unicast / multicast / TCP fan-out / **Zenoh** sinks |
 | `com.adsb.model`    | `AdsbTrack` snapshot, sealed `AdsbFrame` hierarchy, `AircraftStateStore` |
 | `com.adsb.cot`      | `IcaoAircraftClassifier` (MIL-STD-2525), `CoTBuilder` (single-line XML) |
 | `org.opensky.*`     | Vendored [OpenSky java-adsb](https://github.com/openskynetwork/java-adsb) decoder — provides Mode-S parsing + global (no-reference) CPR position decoding |
+| `io.mdudel.zenoh.*` | Vendored [pure-Java Zenoh 1.x client](https://github.com/mdudel/simple-zenoh-java-client) — no JNI, no native libs, TCP/TLS/WS/WSS |
 
 ---
 

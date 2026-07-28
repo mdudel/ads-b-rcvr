@@ -35,9 +35,11 @@ import java.awt.Insets;
  * offers Add / Edit / Remove / Enable-toggle, and delegates the
  * attach/detach lifecycle to a shared {@link ConnectorAttacher}.
  *
- * <p>Zenoh is present in the type dropdown so users can see it's on
- * the roadmap, but selecting it disables the OK button on the add
- * form (with a tooltip explaining that #4 lands it).
+ * <p>All connector types (UDP unicast, UDP multicast, TCP server,
+ * Zenoh) are wire-implemented and selectable. The OK-gating +
+ * per-type tooltip logic is retained so a future scaffolded-but-
+ * unwired type can rejoin the dropdown grayed-out without another
+ * round of surgery here.
  *
  * <p>Persistence: every mutation calls {@link ConnectorStore#save()}
  * so the properties file always mirrors the UI. Save errors surface
@@ -239,7 +241,7 @@ public final class ConnectorsPanel extends JPanel {
                     case UDP_UNICAST:   targetHint.setText("host:port  \u2014 e.g. 192.168.1.50:6969"); break;
                     case UDP_MULTICAST: targetHint.setText("group:port  \u2014 e.g. 239.2.3.1:6969"); break;
                     case TCP_SERVER:    targetHint.setText("port  \u2014 e.g. 30003"); break;
-                    case ZENOH:         targetHint.setText("Not yet implemented \u2014 see issue #4"); break;
+                    case ZENOH:         targetHint.setText("endpoint;key-prefix  \u2014 e.g. tcp/localhost:7447;adsb/cot"); break;
                 }
             };
             typeBox.addActionListener(e -> syncHint.run());
@@ -278,7 +280,7 @@ public final class ConnectorsPanel extends JPanel {
                                 && !targetField.getText().trim().isEmpty());
                         b.setToolTipText(t.isImplemented()
                                 ? null
-                                : "Zenoh is on the roadmap \u2014 see issue #4");
+                                : "This connector type is scaffolded but not yet wired");
                     }
                 }
             };

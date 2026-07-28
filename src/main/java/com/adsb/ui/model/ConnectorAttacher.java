@@ -8,6 +8,7 @@ import com.adsb.model.AircraftStateStore;
 import com.adsb.transport.MulticastForwarder;
 import com.adsb.transport.TcpForwarder;
 import com.adsb.transport.UdpForwarder;
+import com.adsb.transport.ZenohForwarder;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -139,9 +140,15 @@ public final class ConnectorAttacher {
                 t.start();
                 return t;
             }
-            case ZENOH:
-                throw new UnsupportedOperationException(
-                        "Zenoh sink is not yet implemented (issue #4)");
+            case ZENOH: {
+                // Target format: 'endpoint;key-prefix', e.g.
+                //   tcp/localhost:7447;adsb/cot
+                // Split on the FIRST semicolon so key prefixes may contain
+                // slashes (well-formed Zenoh key expressions do) but not
+                // semicolons (which aren't valid in Zenoh keys anyway).
+                String[] ek = splitEndpointAndKey(target, "Zenoh target");
+                return new ZenohForwarder(ek[0], ek[1]);
+            }
             default:
                 throw new IllegalArgumentException("unknown connector type: " + c.type());
         }
@@ -152,5 +159,25 @@ public final class ConnectorAttacher {
         if (i <= 0 || i == s.length() - 1)
             throw new IllegalArgumentException(label + " must be host:port, got '" + s + "'");
         return new String[]{ s.substring(0, i).trim(), s.substring(i + 1).trim() };
+    }
+
+    /**
+     * Split an {@code endpoint;key} connector target into its two halves,
+     * validating that both are non-empty. Used only by the Zenoh case;
+     * lifted out so its parsing rules can be unit-tested directly.
+     * Package-private for tests.
+     */
+    static String[] splitEndpointAndKey(String s, String label) {
+        if (s == null) throw new IllegalArgumentException(label + " is null");
+        int i = s.indexOf(';');
+        if (i <= 0 || i == s.length() - 1)
+            throw new IllegalArgumentException(
+                    label + " must be 'endpoint;key-prefix', got '" + s + "'");
+        String endpoint = s.substring(0, i).trim();
+        String key      = s.substring(i + 1).trim();
+        if (endpoint.isEmpty() || key.isEmpty())
+            throw new IllegalArgumentException(
+                    label + " endpoint and key-prefix must both be non-empty, got '" + s + "'");
+        return new String[]{ endpoint, key };
     }
 }

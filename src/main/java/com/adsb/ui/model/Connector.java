@@ -21,8 +21,13 @@ import java.util.UUID;
  *   <li>{@link Type#UDP_UNICAST}: {@code target} = {@code host:port}</li>
  *   <li>{@link Type#UDP_MULTICAST}: {@code target} = {@code group:port}</li>
  *   <li>{@link Type#TCP_SERVER}: {@code target} = {@code port} (server side)</li>
- *   <li>{@link Type#ZENOH}: {@code target} = {@code endpoint;key-prefix}
- *       (present in the type dropdown but disabled until issue #4 lands)</li>
+ *   <li>{@link Type#ZENOH}: {@code target} = {@code endpoint;key-prefix},
+ *       e.g. {@code tcp/localhost:7447;adsb/cot}. Endpoint is any scheme
+ *       the pure-Java Zenoh facade accepts (tcp / tls / ws / wss);
+ *       key-prefix is the base Zenoh key expression the sink publishes
+ *       under. Per-frame keys are derived per-payload by
+ *       {@link com.adsb.transport.ZenohForwarder} — CoT XML gets a
+ *       per-aircraft sub-key of ICAO24, AVR/JSON go to the base key.</li>
  * </ul>
  */
 public record Connector(
@@ -63,20 +68,25 @@ public record Connector(
         return new Connector(id, name, type, target, payload, e);
     }
 
-    /** Types the UI offers. Zenoh is present but the UI disables it until #4 lands. */
+    /** Types the UI offers. All types are wire-implemented as of the Zenoh landing under #4. */
     public enum Type {
         UDP_UNICAST("UDP unicast"),
         UDP_MULTICAST("UDP multicast"),
         TCP_SERVER("TCP server"),
-        ZENOH("Zenoh (coming soon)");
+        ZENOH("Zenoh");
 
         private final String label;
         Type(String label) { this.label = label; }
         public String label() { return label; }
 
-        /** @return true if this type is implemented today (i.e. can be attached). */
+        /**
+         * @return true if this type is implemented today (i.e. can be attached).
+         *     Kept as a per-type predicate rather than an assertion at attach
+         *     time so a future scaffolded-but-unwired type can rejoin the
+         *     dropdown grayed-out without another round of surgery here.
+         */
         public boolean isImplemented() {
-            return this != ZENOH;
+            return true;
         }
     }
 }
