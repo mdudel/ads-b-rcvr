@@ -1,5 +1,6 @@
 package com.adsb.cli;
 
+import com.adsb.core.AdsbDecoder;
 import com.adsb.core.AdsbReceiver;
 import com.adsb.core.PayloadFormat;
 import com.adsb.core.SinkRegistry;
@@ -68,6 +69,23 @@ public class Main {
         AtomicReference<CoTBuilder> liveBuilder = new AtomicReference<>(
                 new CoTBuilder(initialClassifier,
                         cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds));
+
+        // Configure the position-filter geofence in the shared
+        // OpenSkyFrameAdapter singleton. Explicit --rx-latlon takes
+        // effect from frame #1; without it, the adapter statistically
+        // bootstraps a fence from the first ~20 accepted fixes.
+        AdsbDecoder.configureGeofence(cfg.rxLat, cfg.rxLon, cfg.maxRangeNm);
+        if (cfg.rxLat != null && cfg.rxLon != null) {
+            System.out.printf(
+                    "[INFO] Position geofence: explicit receiver %.5f,%.5f, envelope %.0f nm%n",
+                    cfg.rxLat, cfg.rxLon,
+                    cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
+        } else {
+            System.out.printf(
+                    "[INFO] Position geofence: statistical bootstrap (arms after ~%d fixes, envelope %.0f nm)%n",
+                    com.adsb.core.OpenSkyFrameAdapter.BOOTSTRAP_SAMPLES,
+                    cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
+        }
 
         // Connector store lives in ~/.adsb-rcvr/adsb-rcvr.properties.
         Path storePath = Paths.get(System.getProperty("user.home"),
@@ -279,9 +297,23 @@ public class Main {
                 case "--cot-stale-air":   cfg.cotStaleAirSeconds    = Integer.parseInt(args[++i]); break;
                 case "--cot-stale-ground":cfg.cotStaleGroundSeconds = Integer.parseInt(args[++i]); break;
                 case "--ui":           cfg.ui = true; break;
-                case "--rx-latlon":
-                    i++;
-                    System.err.println("[INFO] --rx-latlon is no longer required and is ignored.");
+                case "--rx-latlon": {
+                    // Optional filter parameter as of 2026-07-29: no longer
+                    // required for CPR decoding (OpenSky decoder does
+                    // global pair decode), but when provided, arms the
+                    // adapter's receiver-relative geofence from frame #1
+                    // instead of the ~20-fix statistical bootstrap.
+                    String[] parts = args[++i].split(",");
+                    if (parts.length != 2) {
+                        throw new IllegalArgumentException(
+                                "--rx-latlon expects LAT,LON (e.g. 50.04277,8.32778)");
+                    }
+                    cfg.rxLat = Double.parseDouble(parts[0].trim());
+                    cfg.rxLon = Double.parseDouble(parts[1].trim());
+                    break;
+                }
+                case "--max-range-nm":
+                    cfg.maxRangeNm = Double.parseDouble(args[++i]);
                     break;
                 case "-h": case "--help":
                     printUsage();
@@ -341,6 +373,16 @@ public class Main {
               --cot-stale-air <seconds>   Airborne stale offset (default 30)
               --cot-stale-ground <seconds>  Ground stale offset (default 120)
 
+            Anti-jump position filter (optional):
+              --rx-latlon <LAT,LON>       Receiver position for the geofence, e.g.
+                                          50.04277,8.32778. NOT required for CPR
+                                          decoding; when omitted, the adapter
+                                          statistically bootstraps a geofence
+                                          from the first ~20 accepted fixes.
+              --max-range-nm <N>          Geofence outer envelope in nm
+                                          (default 350). Applies in both explicit
+                                          and bootstrap modes.
+
             RTL-SDR options:
               --rtl-device <index>        Device index (default: 0)
               --rtl-path <dir>            Folder containing rtl_adsb.exe (if not on PATH)
@@ -383,6 +425,12 @@ public class Main {
         Category    cotCategory    = null;
         int cotStaleAirSeconds     = 30;
         int cotStaleGroundSeconds  = 120;
+
+        /** Optional explicit receiver position for the anti-jump geofence. Null -> statistical bootstrap. */
+        Double rxLat = null;
+        Double rxLon = null;
+        /** Geofence outer envelope, nm. 0 -> use OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM. */
+        double maxRangeNm = 0.0;
 
         boolean hasAnyForwarder() {
             return udpHost != null || multicastGroup != null || tcpPort > 0;

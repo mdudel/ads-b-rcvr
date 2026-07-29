@@ -72,6 +72,16 @@ public class AdsbDecoder {
         return typedAdapter().decode(avrLine);
     }
 
+    /**
+     * Configure the shared adapter's position-filter geofence. See
+     * {@link OpenSkyFrameAdapter#configureGeofence(Double, Double, double)}.
+     * Safe to call before the first {@link #decodeTyped(String)} — the
+     * singleton is materialised on demand.
+     */
+    public static void configureGeofence(Double rxLat, Double rxLon, double maxRangeNm) {
+        typedAdapter().configureGeofence(rxLat, rxLon, maxRangeNm);
+    }
+
     /** Trim leading * and trailing ; and parse hex; returns null on any parse failure. */
     private static byte[] parseAvr(String avrLine) {
         if (avrLine == null) return null;

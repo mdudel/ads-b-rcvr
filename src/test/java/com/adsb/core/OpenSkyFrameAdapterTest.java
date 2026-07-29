@@ -185,6 +185,143 @@ class OpenSkyFrameAdapterTest {
         }
     }
 
+    // ------------------------------------------------------------------
+    // sanityCheckPosition() -- 2026-07-29 anti-jump rewrite
+    //
+    // Three-part gate: (1) range/NaN, (2) receiver-relative geofence,
+    // (3) implied-speed vs last-good with OpenSky-derived jitter
+    // bypass. Tests exercise each part directly via the package-private
+    // API rather than round-tripping AVR frames -- cheaper to author
+    // and keeps each pin focused on ONE rule.
+    // ------------------------------------------------------------------
+
+    @Test
+    void speed_check_accepts_slow_jitter_burst_at_openSky_thresholds() {
+        // Regression pin for the 2026-07-29 false-reject crisis: rtl_adsb
+        // over USB buffers frames in bursts, so two frames the aircraft
+        // transmitted 5s apart on the wire can arrive 0.5s apart in our
+        // readLine loop. A real ~1600 kt implied speed used to be rejected
+        // (1200 kt ceiling); the OpenSky-style jitter bypass
+        // (dt<0.7s AND d<2 km) now unconditionally accepts because the
+        // absolute distance is realistic no matter what the derived speed
+        // says. Frankfurt anchor + a 0.5 nm jump in 0.5 s ~= 3600 kts,
+        // which BOTH the old and new ceilings would reject if not for the
+        // jitter bypass.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        // Disable the geofence so we test the speed rule in isolation.
+        a.configureGeofence(50.04277, 8.32778, 10_000.0);
+        a.seedLastGoodForTest("3C666C", 50.04277, 8.32778, 1000.0);
+        // 0.5 nm north, 0.5 s later -> ~3600 kts implied.
+        double lat2 = 50.04277 + (0.5 / 60.0);
+        assertTrue(a.sanityCheckPosition("3C666C", lat2, 8.32778, 1000.5),
+                "jitter-window burst (dt<0.7s AND d<2km) must be accepted");
+    }
+
+    @Test
+    void speed_check_accepts_up_to_2500_kts_after_ceiling_raise() {
+        // Regression pin for the 2026-07-29 ceiling raise 1200 -> 2500.
+        // OpenSky's own PositionDecoder.withinThreshold uses
+        // 514.4 m/s * 2.5 = 1286 m/s ~= 2500 kts; we now match. Real
+        // 500 kt jets under 2x-3x bursty compression can appear as 1500-
+        // 2000 kts implied, and used to be rejected. This test pins
+        // acceptance at ~2000 kts (well over the old 1200 ceiling, well
+        // under the new 2500 ceiling). Uses dt=10s so the jitter bypass
+        // does NOT apply -- this MUST exercise the speed rule.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.configureGeofence(0.0, 0.0, 10_000.0);
+        a.seedLastGoodForTest("AAA111", 0.0, 0.0, 1000.0);
+        // 5.5 nm east, 10 s later -> 5.5 nm / (10/3600) h = 1980 kts.
+        double lon2 = 5.5 / 60.0;
+        assertTrue(a.sanityCheckPosition("AAA111", 0.0, lon2, 1010.0),
+                "1980 kts implied (below 2500 kt ceiling) must be accepted");
+    }
+
+    @Test
+    void speed_check_still_rejects_above_2500_kts() {
+        // The ceiling raise didn't turn off the speed check -- real
+        // wild-longitude glitches (85 000 / 296 000 / 212 000 kts in the
+        // 2026-07-29 log) MUST still be rejected.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.configureGeofence(0.0, 0.0, 100_000.0);   // ridiculously wide -- test speed rule alone
+        a.seedLastGoodForTest("BBB222", 0.0, 0.0, 1000.0);
+        // 100 nm east, 10s later -> 36 000 kts. Well over 2500.
+        double lon2 = 100.0 / 60.0;
+        assertFalse(a.sanityCheckPosition("BBB222", 0.0, lon2, 1010.0),
+                "36 000 kt implied speed must still be rejected after ceiling raise");
+    }
+
+    @Test
+    void geofence_explicit_rejects_position_outside_envelope() {
+        // Marty's real complaint 2026-07-29: SkyLord shows tracks jumping
+        // across the map because a bad FIRST fix (before any anchor exists)
+        // slipped through. The geofence closes that hole: with an explicit
+        // receiver position it fires from frame #1 regardless of anchor.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        // Frankfurt receiver, 350 nm envelope (default).
+        a.configureGeofence(50.04277, 8.32778, 350.0);
+        // 3170 nm away -- exactly the kind of wild jump the 4B/47/3C ICAOs
+        // in Marty's log produced. No prior anchor.
+        assertFalse(a.sanityCheckPosition("3C0ACB", 50.04277, 60.0, 2000.0),
+                "first fix 3000+ nm from receiver must be rejected by the geofence");
+        // Same receiver, a plausible target 200 nm east -> accepted.
+        double lon = 8.32778 + (200.0 / 60.0);
+        assertTrue(a.sanityCheckPosition("CAFE01", 50.04277, lon, 2001.0),
+                "first fix inside the envelope must be accepted");
+    }
+
+    @Test
+    void geofence_bootstrap_arms_after_twenty_accepted_fixes() {
+        // Bootstrap mode (no --rx-latlon supplied): the geofence stays
+        // OPEN for the first ~20 accepted fixes, then arms itself around
+        // the observed centroid. Pins two invariants: (a) the pre-arm
+        // window accepts fixes that would later be rejected once armed,
+        // (b) the post-arm envelope rejects a fix far outside the
+        // observed cluster.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.configureGeofence(null, null, 350.0);   // bootstrap mode
+
+        // Feed 20 accepted fixes tightly clustered around Frankfurt.
+        // Use the AVR path so the adapter actually feeds the bootstrap
+        // sampler (feedBootstrap is called on ACCEPT).
+        double truthLat = 50.04277, truthLon = 8.32778;
+        for (int i = 0; i < 20; i++) {
+            // Micro-vary lat/lon so each pair is slightly different.
+            double la = truthLat + (i % 5) * 0.001;
+            double lo = truthLon + (i % 3) * 0.001;
+            // Even+odd pair per iteration -> ~10 emitted positions by end;
+            // we need 20 in the sampler so run 20 iterations.
+            a.decode(encodeAirbornePosition("40621D", la, lo, 0));
+            a.decode(encodeAirbornePosition("40621D", la, lo, 1));
+        }
+
+        // Geofence should now be armed. Centre near Frankfurt, envelope <= 350.
+        double[] centre = a.effectiveGeofenceCentre();
+        assertNotNull(centre, "bootstrap geofence must arm after 20 accepted fixes");
+        assertEquals(truthLat, centre[0], 0.01, "bootstrap centroid lat near truth");
+        assertEquals(truthLon, centre[1], 0.01, "bootstrap centroid lon near truth");
+        double r = a.effectiveGeofenceRadiusNm();
+        assertTrue(r > 0.0 && r <= 350.0,
+                "armed envelope in (0, 350] nm; got " + r);
+
+        // Post-arm: a fix 3000 nm out (Marty's 471DB5-style glitch) must reject.
+        assertFalse(a.sanityCheckPosition("471DB5", 50.04277, 60.0, 2000.0),
+                "post-arm bootstrap fence must reject 3000+ nm wild longitude");
+    }
+
+    @Test
+    void geofence_bootstrap_is_open_before_arming() {
+        // Explicit pin for the pre-arm window semantic (deliberate trade:
+        // without a reference we can't fence, so early fixes are gated
+        // only by OpenSky's isReasonable() + the speed check).
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.configureGeofence(null, null, 350.0);
+        // No fixes fed yet -> no anchor + no armed fence -> everything passes.
+        assertTrue(a.sanityCheckPosition("CAFE02", 50.0, 8.0, 1000.0),
+                "pre-arm bootstrap must accept (nothing to compare against)");
+        assertNull(a.effectiveGeofenceCentre(),
+                "pre-arm bootstrap centre must be null (unarmed)");
+    }
+
     @Test
     void evict_removes_position_decoder() {
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();

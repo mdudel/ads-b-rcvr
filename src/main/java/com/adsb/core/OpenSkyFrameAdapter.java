@@ -74,14 +74,31 @@ public final class OpenSkyFrameAdapter {
     private final ConcurrentMap<String, LastGoodPosition> lastGoodPositions = new ConcurrentHashMap<>();
 
     /**
-     * Max plausible aircraft ground speed, knots. Concorde cruised at
-     * ~1350 kts; military jets at combat rarely exceed this for more
-     * than seconds. 1200 kts is a fat-margin sanity ceiling that
-     * still catches the longitude-flip glitches Marty saw on SkyLord
-     * 2026-07-27 15:30 UTC (~500 nm jumps between frames = implied
-     * speed of ~1.8 million kts).
+     * Max plausible aircraft ground speed, knots. OpenSky's own
+     * {@code PositionDecoder.withinThreshold} uses 514.4 m/s * 2.5 =
+     * 1286 m/s ≈ 2500 kts for airborne targets. We used to run at
+     * 1200 kts, which caused mass false-rejects on Marty's 2026-07-29
+     * WARN log: rtl_adsb buffers frames in bursts and inter-frame dt
+     * can compress from a wire-real 5s down to 0.5s, so a real 500
+     * kt jet appears as an implied 5000 kt jump. 2500 kts still
+     * three-orders-of-magnitude-catches the real glitches
+     * (85000/212000/296000 kts) reported in the same log.
      */
-    static final double MAX_PLAUSIBLE_SPEED_KTS = 1200.0;
+    static final double MAX_PLAUSIBLE_SPEED_KTS = 2500.0;
+
+    /**
+     * OpenSky-derived jitter tolerance: when two consecutive frames
+     * arrive so close in time (< {@value #JITTER_DT_SECONDS} s) AND
+     * so close in space (< {@value #JITTER_DISTANCE_NM} nm) that the
+     * distance is realistic no matter what the implied speed says,
+     * accept unconditionally. Mirrors
+     * {@code PositionDecoder.withinThreshold} logic verbatim: 0.7 s
+     * and 2000 m ({@code ≈} 1.08 nm). rtl_adsb over USB is bursty;
+     * without this bypass, back-to-back frames of a real, stationary-
+     * ish target look like impossible-speed jumps.
+     */
+    static final double JITTER_DT_SECONDS  = 0.7;
+    static final double JITTER_DISTANCE_NM = 2000.0 / 1852.0;   // 1.0799 nm
 
     /**
      * Ignore the last-good check when the previous accepted frame is
@@ -91,6 +108,101 @@ public final class OpenSkyFrameAdapter {
      * reasonableness check be the only gate at that point.
      */
     static final double LAST_GOOD_TTL_SECONDS = 60.0;
+
+    // ------------------------------------------------------------------
+    // Receiver-relative geofence (Marty 2026-07-29 07:37 UTC).
+    //
+    // The speed check catches jumps AWAY from a known good anchor,
+    // but has three well-understood holes:
+    //   1. First fix (last == null) always accepts.
+    //   2. dt > LAST_GOOD_TTL_SECONDS bypasses the check.
+    //   3. dt <= 0 (clock skew / same-ms arrival) bypasses.
+    // The geofence closes ALL THREE holes by fixing an absolute box
+    // around the receiver: anything decoded outside the box is
+    // rejected no matter what the anchor state is.
+    //
+    // Two configuration modes:
+    //   A. Explicit: caller supplies receiver lat/lon (via setReceiverPosition).
+    //   B. Bootstrap: no reference provided; adapter learns the
+    //      receiver's approximate location from the first
+    //      BOOTSTRAP_SAMPLES accepted positions (centroid + observed
+    //      radius + BOOTSTRAP_HALO_NM safety margin). Preserves the
+    //      "runs anywhere" contract from the 2026-07-27 ed8f4ef
+    //      commit while still catching wild-longitude aliasing.
+    // ------------------------------------------------------------------
+
+    /** Default outer envelope for the receiver-range check, in nm. Public so CLI help/log can reference it. */
+    public static final double DEFAULT_MAX_RANGE_NM = 350.0;
+
+    /** How many first accepted fixes to collect before enabling the bootstrap geofence. Public so CLI log can reference it. */
+    public static final int BOOTSTRAP_SAMPLES = 20;
+
+    /**
+     * Safety halo added on top of the observed radius when the geofence
+     * is derived statistically. Guards against the bootstrap set being
+     * a tight cluster around one busy airway; a real target 100 nm
+     * further out shouldn't be rejected just because the first 20
+     * fixes happened to land inside 50 nm.
+     */
+    static final double BOOTSTRAP_HALO_NM = 50.0;
+
+    /** Explicit receiver lat/lon, or null when running in bootstrap mode. Written once at boot. */
+    private volatile Double explicitRxLat = null;
+    private volatile Double explicitRxLon = null;
+
+    /** Max-range budget (nm). Applies in both explicit and bootstrap modes. Written once at boot. */
+    private volatile double maxRangeNm = DEFAULT_MAX_RANGE_NM;
+
+    /** Bootstrap sample buffer. Holds accepted (lat, lon) pairs until BOOTSTRAP_SAMPLES land. */
+    private final java.util.List<double[]> bootstrapSamples =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    /** Derived bootstrap geofence: null until BOOTSTRAP_SAMPLES accepted fixes have been seen. */
+    private volatile double[] bootstrapCentroid = null;  // [lat, lon]
+    private volatile double   bootstrapRadiusNm = 0.0;
+
+    /**
+     * Configure the geofence.
+     *
+     * @param rxLat receiver latitude, or {@code null} to run in
+     *              statistical bootstrap mode
+     * @param rxLon receiver longitude, or {@code null} to run in
+     *              statistical bootstrap mode
+     * @param maxRangeNm outer envelope in nm; pass {@code <= 0} to use
+     *              {@link #DEFAULT_MAX_RANGE_NM}. Applies to both modes.
+     *
+     * <p>Must be called at boot before frames start flowing; changing
+     * this at runtime is safe but the old envelope may have already
+     * accepted a fix beyond the new one.
+     */
+    public void configureGeofence(Double rxLat, Double rxLon, double maxRangeNm) {
+        if (rxLat != null && rxLon != null
+                && !Double.isNaN(rxLat) && !Double.isNaN(rxLon)
+                && rxLat >= -90.0 && rxLat <= 90.0
+                && rxLon >= -180.0 && rxLon <= 180.0) {
+            this.explicitRxLat = rxLat;
+            this.explicitRxLon = rxLon;
+        } else {
+            this.explicitRxLat = null;
+            this.explicitRxLon = null;
+        }
+        this.maxRangeNm = (maxRangeNm > 0.0) ? maxRangeNm : DEFAULT_MAX_RANGE_NM;
+    }
+
+    /** Test hook: read the currently-effective geofence centre, or null if bootstrap not yet ready. */
+    double[] effectiveGeofenceCentre() {
+        if (explicitRxLat != null && explicitRxLon != null) {
+            return new double[] { explicitRxLat, explicitRxLon };
+        }
+        return bootstrapCentroid;
+    }
+
+    /** Test hook: read the currently-effective geofence radius (nm). Returns 0 when not yet armed. */
+    double effectiveGeofenceRadiusNm() {
+        if (explicitRxLat != null && explicitRxLon != null) return maxRangeNm;
+        if (bootstrapCentroid == null) return 0.0;
+        return Math.min(maxRangeNm, bootstrapRadiusNm + BOOTSTRAP_HALO_NM);
+    }
 
     /** Per-ICAO rate-limit for the reject WARN so a glitchy aircraft doesn't spam stderr. */
     private static final long REJECT_WARN_INTERVAL_MS = 5_000L;
@@ -196,7 +308,19 @@ public final class OpenSkyFrameAdapter {
             return false;
         }
 
-        // Rule 2: implied-speed check vs last accepted position.
+        // Rule 2: receiver-relative geofence -- the catch-all that fires
+        // on the FIRST bad frame regardless of anchor. Runs in one of
+        // two modes; see the field-doc block on maxRangeNm above.
+        if (!withinGeofence(lat, lon)) {
+            double[] c = effectiveGeofenceCentre();
+            double r  = effectiveGeofenceRadiusNm();
+            warnReject(icao, String.format(
+                    "outside %.0f nm geofence (centre %.4f,%.4f; dist %.1f nm)",
+                    r, c[0], c[1], haversineNm(c[0], c[1], lat, lon)));
+            return false;
+        }
+
+        // Rule 3: implied-speed check vs last accepted position.
         LastGoodPosition last = lastGoodPositions.get(icao);
         if (last == null) return true;                    // first fix; nothing to compare
         double dtSec = timeSec - last.timeSec();
@@ -204,6 +328,15 @@ public final class OpenSkyFrameAdapter {
         if (dtSec > LAST_GOOD_TTL_SECONDS) return true;   // stale last-good; skip check
 
         double distNm = haversineNm(last.lat(), last.lon(), lat, lon);
+
+        // OpenSky-derived jitter bypass: back-to-back frames of a
+        // near-stationary target shouldn't trip the speed check just
+        // because rtl_adsb's stdout buffer emitted them 0.2s apart.
+        // See JITTER_DT_SECONDS / JITTER_DISTANCE_NM javadoc for why.
+        if (dtSec < JITTER_DT_SECONDS && distNm < JITTER_DISTANCE_NM) {
+            return true;
+        }
+
         double impliedKts = distNm / (dtSec / 3600.0);
         if (impliedKts > MAX_PLAUSIBLE_SPEED_KTS) {
             warnReject(icao, String.format(
@@ -212,6 +345,65 @@ public final class OpenSkyFrameAdapter {
             return false;
         }
         return true;
+    }
+
+    /**
+     * True when the given position is inside the receiver-relative
+     * geofence, OR when the geofence hasn't yet armed (bootstrap mode
+     * with < BOOTSTRAP_SAMPLES accepted fixes). In the pre-arm window
+     * we only rely on the speed check and OpenSky's own
+     * isReasonable() -- that's a deliberate trade: without a reference,
+     * we can't fence, so the first ~20 fixes are gated only by the
+     * upstream OpenSky checks. In practice the first fixes ARE close
+     * to the receiver because ADS-B LOS drops off sharply beyond
+     * ~350 nm, so the bootstrap centroid settles quickly.
+     */
+    private boolean withinGeofence(double lat, double lon) {
+        // Explicit mode: always active from the very first frame.
+        if (explicitRxLat != null && explicitRxLon != null) {
+            return haversineNm(explicitRxLat, explicitRxLon, lat, lon) <= maxRangeNm;
+        }
+
+        // Bootstrap mode: armed only after BOOTSTRAP_SAMPLES accepted fixes.
+        double[] centre = bootstrapCentroid;
+        if (centre == null) return true;   // not yet armed
+
+        // Effective envelope = min(explicit ceiling, observed radius + halo).
+        // The min() protects against a bootstrap that observed a tight
+        // cluster: we never widen beyond maxRangeNm, even if the
+        // observed radius + halo would.
+        double envelope = Math.min(maxRangeNm, bootstrapRadiusNm + BOOTSTRAP_HALO_NM);
+        return haversineNm(centre[0], centre[1], lat, lon) <= envelope;
+    }
+
+    /**
+     * Feed one just-accepted position into the bootstrap sampler.
+     * When the sample count reaches {@link #BOOTSTRAP_SAMPLES}, derive
+     * the centroid + max observed radius and arm the geofence.
+     * No-op when running in explicit mode.
+     */
+    private void feedBootstrap(double lat, double lon) {
+        if (explicitRxLat != null && explicitRxLon != null) return;
+        if (bootstrapCentroid != null) return; // already armed
+        synchronized (bootstrapSamples) {
+            bootstrapSamples.add(new double[] { lat, lon });
+            if (bootstrapSamples.size() < BOOTSTRAP_SAMPLES) return;
+            double sumLat = 0.0, sumLon = 0.0;
+            for (double[] p : bootstrapSamples) { sumLat += p[0]; sumLon += p[1]; }
+            double cLat = sumLat / bootstrapSamples.size();
+            double cLon = sumLon / bootstrapSamples.size();
+            double maxNm = 0.0;
+            for (double[] p : bootstrapSamples) {
+                double d = haversineNm(cLat, cLon, p[0], p[1]);
+                if (d > maxNm) maxNm = d;
+            }
+            bootstrapCentroid = new double[] { cLat, cLon };
+            bootstrapRadiusNm = maxNm;
+            bootstrapSamples.clear();  // no longer needed; free memory
+            System.err.printf(
+                    "[INFO] Geofence armed (bootstrap): centre %.4f,%.4f, envelope %.1f nm%n",
+                    cLat, cLon, Math.min(maxRangeNm, maxNm + BOOTSTRAP_HALO_NM));
+        }
     }
 
     /** Great-circle distance in nautical miles. */
@@ -289,6 +481,7 @@ public final class OpenSkyFrameAdapter {
         }
         lastGoodPositions.put(icao,
                 new LastGoodPosition(p.getLatitude(), p.getLongitude(), timeSec));
+        feedBootstrap(p.getLatitude(), p.getLongitude());
 
         // OpenSky's AirbornePositionV0Msg.getAltitude() returns the
         // DECODED value from the 12-bit AC field of a DF17/18 TC 9-18
