@@ -8,8 +8,9 @@ import com.adsb.ui.model.ZenohMode;
 import com.adsb.ui.model.ZenohTransport;
 
 import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
 import javax.swing.DefaultListCellRenderer;
-import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
@@ -21,50 +22,56 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTextField;
+import javax.swing.ScrollPaneConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.UIManager;
 import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Component;
+import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.io.File;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 /**
- * The Connectors dock: shows every configured {@link Connector},
- * offers Add / Edit / Remove / Enable-toggle, and delegates the
- * attach/detach lifecycle to a shared {@link ConnectorAttacher}.
+ * The Connectors dock: shows every configured {@link Connector} as a
+ * card in a vertical stack, offers per-row Start/Stop + Edit + Remove
+ * buttons, and delegates the attach/detach lifecycle to a shared
+ * {@link ConnectorAttacher}.
  *
  * <p>All connector types (UDP unicast, UDP multicast, TCP server,
- * Zenoh) are wire-implemented and selectable. The OK-gating +
- * per-type tooltip logic is retained so a future scaffolded-but-
- * unwired type can rejoin the dropdown grayed-out without another
- * round of surgery here.
+ * Zenoh) are wire-implemented. The OK-gating + per-type tooltip
+ * logic is retained so a future scaffolded-but-unwired type can
+ * rejoin the dropdown grayed-out.
  *
- * <p>Persistence: every mutation calls {@link ConnectorStore#save()}
- * so the properties file always mirrors the UI. Save errors surface
- * as a dialog; the in-memory list is not rolled back (matches
- * {@link ConnectorStore#save()} contract).
+ * <p><b>Per-row Start/Stop</b> (added 2026-07-29 15:32 UTC): each
+ * connector card has its own toggle button so the operator doesn't
+ * have to open the edit dialog + tick/untick the Enabled box + save
+ * just to pause one feed. Click Stop -> attacher.detach + persist
+ * disabled=false; click Start -> attacher.attach + persist
+ * disabled=true. The card's border colour mirrors the state
+ * (green = running, grey = stopped) so the dashboard reads at a
+ * glance.
  *
- * <p><b>Zenoh sub-form</b> (added 2026-07-29 for Marty's rich Zenoh
- * connector work): when the type dropdown is set to ZENOH, the
- * generic "Target" line hides and a dedicated grid appears with
- * dropdown Transport, separate Endpoint / Root topic / Topic fields,
- * three Browse-button rows for the TLS material, and a Verify-host
- * checkbox. TLS rows grey out when the transport is TCP/WS.
- * "Last-used cert dir" is remembered in the properties file via
- * {@link #lastCertDirRef} so repeated Browse clicks don't force the
- * operator to re-navigate to their PEM stash.
+ * <p><b>Persistence</b>: every mutation calls
+ * {@link ConnectorStore#save()} so the properties file always mirrors
+ * the UI. Save errors surface as a dialog; the in-memory list is not
+ * rolled back (matches {@link ConnectorStore#save()} contract).
  */
 public final class ConnectorsPanel extends JPanel {
 
     private final ConnectorStore     store;
     private final ConnectorAttacher  attacher;
-    private final DefaultListModel<Connector> listModel = new DefaultListModel<>();
-    private final JList<Connector>   list;
+
+    /** Vertical BoxLayout container holding one card per connector. */
+    private final JPanel             rowContainer;
 
     /**
      * Mutable ref holding the last directory a Browse button visited.
@@ -98,27 +105,21 @@ public final class ConnectorsPanel extends JPanel {
 
         setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
 
-        this.list = new JList<>(listModel);
-        list.setCellRenderer(new ConnectorCellRenderer());
-        list.setVisibleRowCount(6);
-        list.setSelectionMode(javax.swing.ListSelectionModel.SINGLE_SELECTION);
-        add(new JScrollPane(list), BorderLayout.CENTER);
+        this.rowContainer = new JPanel();
+        rowContainer.setLayout(new BoxLayout(rowContainer, BoxLayout.Y_AXIS));
+        // Wrapper so BoxLayout doesn't stretch the last row to fill the
+        // viewport; the vertical glue after the rows keeps them top-aligned.
+        JScrollPane scroll = new JScrollPane(rowContainer,
+                ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        scroll.getVerticalScrollBar().setUnitIncrement(16);
+        add(scroll, BorderLayout.CENTER);
 
-        JButton addBtn    = new JButton("Add\u2026");
-        JButton editBtn   = new JButton("Edit\u2026");
-        JButton removeBtn = new JButton("Remove");
-        JButton toggleBtn = new JButton("Toggle enabled");
-
-        addBtn   .addActionListener(e -> onAdd());
-        editBtn  .addActionListener(e -> onEdit());
-        removeBtn.addActionListener(e -> onRemove());
-        toggleBtn.addActionListener(e -> onToggle());
+        JButton addBtn = new JButton("Add\u2026");
+        addBtn.addActionListener(e -> onAdd());
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
         buttons.add(addBtn);
-        buttons.add(editBtn);
-        buttons.add(removeBtn);
-        buttons.add(toggleBtn);
         add(buttons, BorderLayout.SOUTH);
 
         // Refresh whenever the store changes.
@@ -126,18 +127,137 @@ public final class ConnectorsPanel extends JPanel {
         reload();
     }
 
+    // ------------------------------------------------------------------
+    // list rendering
+    // ------------------------------------------------------------------
+
     private void reload() {
-        Connector prev = list.getSelectedValue();
-        listModel.clear();
-        for (Connector c : store.list()) listModel.addElement(c);
-        if (prev != null) {
-            for (int i = 0; i < listModel.size(); i++) {
-                if (listModel.get(i).id().equals(prev.id())) {
-                    list.setSelectedIndex(i);
-                    break;
-                }
-            }
+        rowContainer.removeAll();
+        for (Connector c : store.list()) {
+            rowContainer.add(buildRow(c));
+            rowContainer.add(Box.createVerticalStrut(4));
         }
+        rowContainer.add(Box.createVerticalGlue());
+        rowContainer.revalidate();
+        rowContainer.repaint();
+    }
+
+    /**
+     * Build one card for a connector: status pip + name/type/target
+     * summary on the left, Start/Stop + Edit + Remove buttons on the
+     * right.
+     */
+    private JPanel buildRow(Connector c) {
+        JPanel row = new JPanel(new BorderLayout(8, 4));
+        row.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(borderColorFor(c), 1, true),
+                BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+        // Cap height so BoxLayout doesn't stretch a single card to fill
+        // vertical space when the list is short.
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, row.getPreferredSize().height + 30));
+        row.setAlignmentX(LEFT_ALIGNMENT);
+
+        // --- LEFT: HTML label with status + name + type/target/payload ---
+        JLabel info = new JLabel(renderInfo(c));
+        info.setToolTipText(tooltipFor(c));
+
+        // --- RIGHT: button strip ---
+        JButton toggleBtn = new JButton(c.enabled() ? "Stop" : "Start");
+        toggleBtn.setForeground(c.enabled() ? new Color(0xC0, 0x39, 0x2B) : new Color(0x27, 0xAE, 0x60));
+        toggleBtn.setFocusable(false);
+        toggleBtn.setToolTipText(c.enabled()
+                ? "Detach and disable this connector (stops sending)"
+                : "Enable and attach this connector (starts sending)");
+        toggleBtn.addActionListener(e -> onToggle(c));
+
+        JButton editBtn = new JButton("Edit\u2026");
+        editBtn.setFocusable(false);
+        editBtn.addActionListener(e -> onEdit(c));
+
+        JButton removeBtn = new JButton("Remove");
+        removeBtn.setFocusable(false);
+        removeBtn.addActionListener(e -> onRemove(c));
+
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        right.setOpaque(false);
+        right.add(toggleBtn);
+        right.add(editBtn);
+        right.add(removeBtn);
+
+        row.add(info,  BorderLayout.CENTER);
+        row.add(right, BorderLayout.EAST);
+
+        // Double-click the info label opens Edit -- keeps the classic
+        // shortcut the JList had.
+        info.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) onEdit(c);
+            }
+        });
+        info.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+
+        return row;
+    }
+
+    private static Color borderColorFor(Connector c) {
+        if (c.enabled()) return new Color(0x27, 0xAE, 0x60);   // green
+        Color base = UIManager.getColor("Separator.foreground");
+        return base != null ? base : Color.LIGHT_GRAY;
+    }
+
+    private static String renderInfo(Connector c) {
+        String status = c.enabled() ? "\u25cf" : "\u25cb";
+        String statusColour = c.enabled() ? "#27AE60" : "#888";
+        String targetDisplay = (c.type() == Connector.Type.ZENOH)
+                ? renderZenohTarget(c)
+                : escape(c.target());
+        String zenohHint = (c.type() == Connector.Type.ZENOH)
+                ? "&nbsp;&nbsp;<i>" + c.zenohMode().label() + "</i>"
+                : "";
+        return "<html><span style='color:" + statusColour + ";font-size:14pt;'>" + status + "</span>"
+                + "&nbsp;<b>" + escape(c.name()) + "</b>"
+                + "<br><small>" + c.type().label()
+                + " \u2192 " + targetDisplay
+                + "&nbsp;&nbsp;[" + c.payload() + "]"
+                + zenohHint
+                + "</small></html>";
+    }
+
+    private static String tooltipFor(Connector c) {
+        StringBuilder sb = new StringBuilder("<html>");
+        sb.append("<b>").append(escape(c.name())).append("</b>");
+        sb.append("<br>Type: ").append(c.type().label());
+        sb.append("<br>Payload: ").append(c.payload());
+        sb.append("<br>Status: ").append(c.enabled() ? "<b>running</b>" : "stopped");
+        if (c.type() == Connector.Type.ZENOH) {
+            sb.append("<br>Transport: ").append(c.zenohTransport());
+            sb.append("<br>Endpoint: ").append(escape(c.zenohEndpoint()));
+            if (c.zenohOrg() != null && !c.zenohOrg().isBlank())
+                sb.append("<br>Root topic: ").append(escape(c.zenohOrg()));
+            sb.append("<br>Topic: ").append(escape(c.zenohKeyExpr()));
+            sb.append("<br>Zenoh mode: ").append(c.zenohMode().label());
+            if (c.zenohTransport() != null && c.zenohTransport().isTls()) {
+                sb.append("<br>Verify TLS host: ").append(c.zenohVerifyHostname());
+            }
+        } else {
+            sb.append("<br>Target: ").append(escape(c.target()));
+        }
+        sb.append("<br><i>Double-click to edit</i>");
+        sb.append("</html>");
+        return sb.toString();
+    }
+
+    private static String renderZenohTarget(Connector c) {
+        String scheme = c.zenohTransport() == null ? "tcp" : c.zenohTransport().scheme();
+        String ep = c.zenohEndpoint() == null ? "?" : c.zenohEndpoint();
+        String key = c.zenohKeyExpr() == null ? "?" : c.zenohKeyExpr();
+        String org = (c.zenohOrg() == null || c.zenohOrg().isBlank()) ? "" : (c.zenohOrg() + "/");
+        return escape(scheme + "/" + ep + "  \u2192  " + org + key);
+    }
+
+    private static String escape(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
     // ------------------------------------------------------------------
@@ -151,8 +271,7 @@ public final class ConnectorsPanel extends JPanel {
         persistThen(() -> attach(c));
     }
 
-    private void onEdit() {
-        Connector sel = list.getSelectedValue();
+    private void onEdit(Connector sel) {
         if (sel == null) return;
         Connector edited = ConnectorEditDialog.showFor(this, sel, lastCertDirRef, lastCertDirSetter);
         if (edited == null) return;
@@ -164,8 +283,7 @@ public final class ConnectorsPanel extends JPanel {
         });
     }
 
-    private void onRemove() {
-        Connector sel = list.getSelectedValue();
+    private void onRemove(Connector sel) {
         if (sel == null) return;
         int r = JOptionPane.showConfirmDialog(this,
                 "Remove connector \"" + sel.name() + "\"?",
@@ -176,8 +294,13 @@ public final class ConnectorsPanel extends JPanel {
         persistSilently();
     }
 
-    private void onToggle() {
-        Connector sel = list.getSelectedValue();
+    /**
+     * Toggle a connector's enabled state. If it's currently enabled we
+     * detach + disable; if disabled we enable + attach. Attach failures
+     * surface as a dialog and leave the record disabled (matches
+     * {@link #attach}'s auto-disable-on-failure policy).
+     */
+    private void onToggle(Connector sel) {
         if (sel == null) return;
         Connector flipped = sel.withEnabled(!sel.enabled());
         store.update(flipped);
@@ -215,48 +338,6 @@ public final class ConnectorsPanel extends JPanel {
             JOptionPane.showMessageDialog(this,
                     "Save failed:\n" + ex.getMessage(),
                     "Save failed", JOptionPane.ERROR_MESSAGE);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // list renderer
-    // ------------------------------------------------------------------
-
-    private static final class ConnectorCellRenderer extends DefaultListCellRenderer {
-        @Override
-        public Component getListCellRendererComponent(JList<?> list, Object value, int index,
-                                                       boolean isSelected, boolean cellHasFocus) {
-            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
-            if (value instanceof Connector c) {
-                String status = c.enabled() ? "\u25cf" : "\u25cb";
-                // For Zenoh rows the 'target' is empty; render the
-                // richer field set inline so the operator can see at
-                // a glance what's configured.
-                String targetDisplay = (c.type() == Connector.Type.ZENOH)
-                        ? renderZenohTarget(c)
-                        : escape(c.target());
-                String zenohHint = (c.type() == Connector.Type.ZENOH)
-                        ? "&nbsp;&nbsp;<i>" + c.zenohMode().label() + "</i>"
-                        : "";
-                setText("<html><b>" + status + " " + escape(c.name()) + "</b>"
-                        + "<br><small>" + c.type().label()
-                        + " \u2192 " + targetDisplay
-                        + "&nbsp;&nbsp;[" + c.payload() + "]"
-                        + zenohHint
-                        + "</small></html>");
-            }
-            return this;
-        }
-        private static String renderZenohTarget(Connector c) {
-            String scheme = c.zenohTransport() == null ? "tcp" : c.zenohTransport().scheme();
-            String ep = c.zenohEndpoint() == null ? "?" : c.zenohEndpoint();
-            String key = c.zenohKeyExpr() == null ? "?" : c.zenohKeyExpr();
-            String org = (c.zenohOrg() == null || c.zenohOrg().isBlank()) ? "" : (c.zenohOrg() + "/");
-            return escape(scheme + "/" + ep + "  \u2192  " + org + key);
-        }
-        private static String escape(String s) {
-            if (s == null) return "";
-            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
         }
     }
 
@@ -384,11 +465,8 @@ public final class ConnectorsPanel extends JPanel {
             JLabel   targetLabel = new JLabel("Target:");
             addRow(form, gc, y++, targetLabel, targetField);
             gc.gridx = 1; gc.gridy = y++; form.add(targetHint, gc);
-            final int genericTargetRowStart = 2;   // rows 2..3 host generic Target
-            final int genericTargetRowEnd   = 3;
 
             // ----- Zenoh sub-form rows
-            int zStart = y;
             JLabel lblTransport = new JLabel("Transport:");
             addRow(form, gc, y++, lblTransport, zenohTransportBox);
             JLabel lblEndpoint  = new JLabel("Endpoint (host:port):");
@@ -405,7 +483,6 @@ public final class ConnectorsPanel extends JPanel {
             addBrowseRow(form, gc, y++, lblCa,   zenohCaField,   zenohCaBrowse);
             gc.gridx = 1; gc.gridy = y++; form.add(zenohVerifyBox, gc);
             gc.gridx = 1; gc.gridy = y++; form.add(zenohPreviewLabel, gc);
-            int zEnd = y - 1;
 
             // ----- payload + mode + enabled (bottom shared block)
             addRow(form, gc, y++, "Payload:",     payBox);
