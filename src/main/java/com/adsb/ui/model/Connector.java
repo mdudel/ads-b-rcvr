@@ -21,16 +21,44 @@ import java.util.UUID;
  *   <li>{@link Type#UDP_UNICAST}: {@code target} = {@code host:port}</li>
  *   <li>{@link Type#UDP_MULTICAST}: {@code target} = {@code group:port}</li>
  *   <li>{@link Type#TCP_SERVER}: {@code target} = {@code port} (server side)</li>
- *   <li>{@link Type#ZENOH}: {@code target} = {@code endpoint;key-prefix},
- *       e.g. {@code tcp/localhost:7447;adsb/cot}. Endpoint is any scheme
- *       the pure-Java Zenoh facade accepts (tcp / tls / ws / wss);
- *       key-prefix is the base Zenoh key expression the sink publishes
- *       under. See {@link #zenohMode} for the per-frame key layout.</li>
+ *   <li>{@link Type#ZENOH}: {@code target} is unused (kept blank);
+ *       the connector reads {@link #zenohTransport} / {@link #zenohEndpoint} /
+ *       {@link #zenohOrg} / {@link #zenohKeyExpr} / TLS material instead.
+ *       This split was landed 2026-07-29 (commit after 0d4cdd6) to let
+ *       the UI expose a proper form with a dropdown for the transport,
+ *       Browse buttons for the cert/key/CA files, and separate root /
+ *       topic fields (previously all shoved into one semicolon-joined
+ *       target string).</li>
  * </ul>
  *
- * <p>{@link #zenohMode} is meaningful only for {@link Type#ZENOH}
- * connectors but is persisted on every record for schema simplicity.
- * Other types read/write the field but ignore it at attach time.
+ * <p><b>Zenoh field semantics</b> (meaningful only when
+ * {@link #type} == {@link Type#ZENOH}, all others may be null on other types):
+ * <ul>
+ *   <li>{@link #zenohTransport}: wire transport (TCP / TLS / WS / WSS).</li>
+ *   <li>{@link #zenohEndpoint}: {@code host:port} without the URI scheme
+ *       (the scheme is prepended from {@code zenohTransport} at connect
+ *       time). Example: {@code 100.64.165.203:7447}.</li>
+ *   <li>{@link #zenohOrg}: root / vendor / tenant prefix. Prepended to
+ *       {@code zenohKeyExpr} before publish via
+ *       {@link io.mdudel.zenoh.purejava.wire.KeyExpr#resolveKey(String, String)}
+ *       with slash normalisation. May be null or blank -- then the
+ *       topic is published bare.</li>
+ *   <li>{@link #zenohKeyExpr}: the topic to publish under, e.g.
+ *       {@code tracks/adsb}. Combined with {@code zenohOrg} yields
+ *       {@code <org>/<topic>} (or just {@code <topic>} if org is blank).</li>
+ *   <li>{@link #zenohClientCertPath}, {@link #zenohClientKeyPath},
+ *       {@link #zenohRootCaPath}: filesystem paths to PEM material.
+ *       Required only when {@code zenohTransport.isTls()} is true.</li>
+ *   <li>{@link #zenohVerifyHostname}: TLS hostname verification.
+ *       Default false because IP endpoints (Tailscale/CGNAT) usually
+ *       don't have the IP as a cert SAN. Set true when the endpoint is
+ *       a real DNS name.</li>
+ * </ul>
+ *
+ * <p>{@link #zenohMode} controls the per-frame sub-key layout
+ * (STREAM: everything to one topic; PER_AIRCRAFT: append ICAO under
+ * the topic). Meaningful only for {@link Type#ZENOH} but persisted on
+ * every record for schema simplicity.
  */
 public record Connector(
         /** Stable UUID. Never mutated across edits so persistence keys stay valid. */
@@ -42,7 +70,7 @@ public record Connector(
         /** Wire type. See per-type target semantics in the class javadoc. */
         Type type,
 
-        /** Target string; interpretation depends on {@link #type}. */
+        /** Target string; interpretation depends on {@link #type}. Unused for ZENOH. */
         String target,
 
         /** Payload format. Same enum the CLI --payload flag uses. */
@@ -50,14 +78,43 @@ public record Connector(
 
         /**
          * Zenoh key-layout mode. Meaningful only for {@link Type#ZENOH};
-         * ignored (but persisted) for other types. Never null — the
+         * ignored (but persisted) for other types. Never null -- the
          * canonical ctor coerces null to {@link ZenohMode#PER_AIRCRAFT}
          * to preserve the pre-{@code ZenohMode} shipping default.
          */
         ZenohMode zenohMode,
 
         /** {@code true} = attach at startup / on save; {@code false} = keep in the list but don't attach. */
-        boolean enabled
+        boolean enabled,
+
+        /**
+         * Zenoh wire transport. Nullable on non-Zenoh types; the
+         * canonical ctor coerces null to {@link ZenohTransport#TCP}
+         * on Zenoh types so the persistence layer never has to make
+         * one up.
+         */
+        ZenohTransport zenohTransport,
+
+        /** Zenoh endpoint {@code host:port} without URI scheme. Nullable on non-Zenoh types. */
+        String zenohEndpoint,
+
+        /** Zenoh root / vendor topic prefix. Nullable or blank means "no prefix". */
+        String zenohOrg,
+
+        /** Zenoh topic (key expression). Required on Zenoh types; nullable on others. */
+        String zenohKeyExpr,
+
+        /** TLS client-cert PEM path. Required when {@link #zenohTransport} is TLS/WSS. */
+        String zenohClientCertPath,
+
+        /** TLS client-key PEM path. Required when {@link #zenohTransport} is TLS/WSS. */
+        String zenohClientKeyPath,
+
+        /** TLS truststore (CA root) PEM path. Required when {@link #zenohTransport} is TLS/WSS. */
+        String zenohRootCaPath,
+
+        /** TLS hostname-verification. False by default (IP endpoints); set true for DNS endpoints. */
+        boolean zenohVerifyHostname
 ) {
     public Connector {
         Objects.requireNonNull(id,      "id");
@@ -66,28 +123,68 @@ public record Connector(
         Objects.requireNonNull(target,  "target");
         Objects.requireNonNull(payload, "payload");
         if (zenohMode == null) zenohMode = ZenohMode.PER_AIRCRAFT;
+        if (type == Type.ZENOH && zenohTransport == null) zenohTransport = ZenohTransport.TCP;
     }
 
     /**
-     * Convenience factory for a fresh connector; uses
-     * {@link ZenohMode#PER_AIRCRAFT} as the Zenoh mode default so
-     * legacy call sites don't need to pass one explicitly.
+     * Legacy 7-arg convenience constructor for pre-2026-07-29-refactor
+     * call sites (tests + the ConnectorsPanel shared-fields edit path).
+     * Zenoh-specific fields default to null / TCP / false. Use the
+     * canonical 15-arg record ctor or {@link #newZenoh} when populating
+     * the Zenoh rich-form fields.
+     */
+    public Connector(String id, String name, Type type, String target,
+                     PayloadFormat payload, ZenohMode zenohMode, boolean enabled) {
+        this(id, name, type, target, payload, zenohMode, enabled,
+                null, null, null, null, null, null, null, false);
+    }
+
+    /**
+     * Convenience factory for a fresh non-Zenoh connector; uses
+     * {@link ZenohMode#PER_AIRCRAFT} as the (unused) Zenoh mode default
+     * so legacy call sites don't need to pass one explicitly. Zenoh
+     * fields default to null and must not be used for non-Zenoh types.
      */
     public static Connector newInstance(String name, Type type, String target,
                                         PayloadFormat payload, boolean enabled) {
-        return newInstance(name, type, target, payload, ZenohMode.PER_AIRCRAFT, enabled);
+        return new Connector(UUID.randomUUID().toString(),
+                name, type, target, payload, ZenohMode.PER_AIRCRAFT, enabled,
+                null, null, null, null, null, null, null, false);
     }
 
-    /** Full-arg factory: fresh UUID + operator-chosen Zenoh mode. */
+    /** Full-arg factory: fresh UUID + operator-chosen Zenoh mode (non-Zenoh path). */
     public static Connector newInstance(String name, Type type, String target,
                                         PayloadFormat payload, ZenohMode zenohMode,
                                         boolean enabled) {
         return new Connector(UUID.randomUUID().toString(),
-                name, type, target, payload, zenohMode, enabled);
+                name, type, target, payload, zenohMode, enabled,
+                null, null, null, null, null, null, null, false);
+    }
+
+    /** Zenoh-specific factory. Endpoint should be {@code host:port} (no scheme). */
+    public static Connector newZenoh(String name,
+                                     ZenohTransport transport,
+                                     String endpoint,
+                                     String org,
+                                     String keyExpr,
+                                     PayloadFormat payload,
+                                     ZenohMode zenohMode,
+                                     String clientCertPath,
+                                     String clientKeyPath,
+                                     String rootCaPath,
+                                     boolean verifyHostname,
+                                     boolean enabled) {
+        return new Connector(UUID.randomUUID().toString(),
+                name, Type.ZENOH, "", payload, zenohMode, enabled,
+                transport == null ? ZenohTransport.TCP : transport,
+                endpoint, org, keyExpr,
+                clientCertPath, clientKeyPath, rootCaPath, verifyHostname);
     }
 
     public Connector withEnabled(boolean e) {
-        return new Connector(id, name, type, target, payload, zenohMode, e);
+        return new Connector(id, name, type, target, payload, zenohMode, e,
+                zenohTransport, zenohEndpoint, zenohOrg, zenohKeyExpr,
+                zenohClientCertPath, zenohClientKeyPath, zenohRootCaPath, zenohVerifyHostname);
     }
 
     /**
@@ -96,7 +193,9 @@ public record Connector(
      *         registry keeps its handle).
      */
     public Connector withZenohMode(ZenohMode m) {
-        return new Connector(id, name, type, target, payload, m, enabled);
+        return new Connector(id, name, type, target, payload, m, enabled,
+                zenohTransport, zenohEndpoint, zenohOrg, zenohKeyExpr,
+                zenohClientCertPath, zenohClientKeyPath, zenohRootCaPath, zenohVerifyHostname);
     }
 
     /** Types the UI offers. All types are wire-implemented as of the Zenoh landing under #4. */

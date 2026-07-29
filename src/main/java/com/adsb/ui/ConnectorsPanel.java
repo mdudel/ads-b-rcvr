@@ -349,7 +349,19 @@ public final class ConnectorsPanel extends JPanel {
             if (existing == null) {
                 return Connector.newInstance(name, type, target, pay, mode, enabled);
             }
-            return new Connector(existing.id(), name, type, target, pay, mode, enabled);
+            // Preserve every field on the existing row that we don't
+            // touch here (Zenoh fields are edited in the Zenoh sub-form
+            // added in Phase 3; this legacy code path only handles the
+            // shared name/type/target/payload/mode/enabled group).
+            return new Connector(existing.id(), name, type, target, pay, mode, enabled,
+                    existing.zenohTransport(),
+                    existing.zenohEndpoint(),
+                    existing.zenohOrg(),
+                    existing.zenohKeyExpr(),
+                    existing.zenohClientCertPath(),
+                    existing.zenohClientKeyPath(),
+                    existing.zenohRootCaPath(),
+                    existing.zenohVerifyHostname());
         }
 
         /** Walk the pane to find its OK/Cancel buttons so we can enable/disable OK. */

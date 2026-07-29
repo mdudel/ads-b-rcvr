@@ -99,7 +99,7 @@ public final class ConnectorStore {
             String base = PREFIX + c.id() + ".";
             p.setProperty(base + "name",    c.name());
             p.setProperty(base + "type",    c.type().name());
-            p.setProperty(base + "target",  c.target());
+            p.setProperty(base + "target",  c.target() == null ? "" : c.target());
             p.setProperty(base + "payload", c.payload().name());
             // zenohMode is meaningful only for ZENOH connectors but is
             // persisted on every record for schema simplicity. Backwards
@@ -108,6 +108,28 @@ public final class ConnectorStore {
             // default; see ZenohMode.parseOrDefault javadoc).
             p.setProperty(base + "zenohMode", c.zenohMode().name());
             p.setProperty(base + "enabled", Boolean.toString(c.enabled()));
+            // New (2026-07-29) Zenoh-specific fields. Only written for
+            // ZENOH connectors -- keeps the properties file tidy for
+            // UDP/TCP rows. Null-safe: absent fields load as null and
+            // the record ctor coerces to sensible defaults.
+            if (c.type() == Connector.Type.ZENOH) {
+                if (c.zenohTransport() != null)
+                    p.setProperty(base + "zenohTransport", c.zenohTransport().name());
+                if (c.zenohEndpoint() != null)
+                    p.setProperty(base + "zenohEndpoint", c.zenohEndpoint());
+                if (c.zenohOrg() != null)
+                    p.setProperty(base + "zenohOrg", c.zenohOrg());
+                if (c.zenohKeyExpr() != null)
+                    p.setProperty(base + "zenohKeyExpr", c.zenohKeyExpr());
+                if (c.zenohClientCertPath() != null)
+                    p.setProperty(base + "zenohClientCertPath", c.zenohClientCertPath());
+                if (c.zenohClientKeyPath() != null)
+                    p.setProperty(base + "zenohClientKeyPath", c.zenohClientKeyPath());
+                if (c.zenohRootCaPath() != null)
+                    p.setProperty(base + "zenohRootCaPath", c.zenohRootCaPath());
+                p.setProperty(base + "zenohVerifyHostname",
+                        Boolean.toString(c.zenohVerifyHostname()));
+            }
         }
         Path tmp = file.resolveSibling(file.getFileName().toString() + ".tmp");
         try (var out = Files.newBufferedWriter(tmp)) {
@@ -193,14 +215,63 @@ public final class ConnectorStore {
         String payStr  = m.get("payload");
         String modeStr = m.get("zenohMode");   // may be absent on pre-mode files
         String enabled = m.get("enabled");
-        if (name == null || typeStr == null || target == null || payStr == null) return null;
+        if (name == null || typeStr == null || payStr == null) return null;
+
+        Connector.Type type;
+        try { type = Connector.Type.valueOf(typeStr); }
+        catch (IllegalArgumentException e) {
+            System.err.println("[connector-store] skipping unknown type id=" + id + ": " + typeStr);
+            return null;
+        }
+
+        // Marty 2026-07-29 14:01 UTC: "Nuke and fresh start (keep the
+        // UDP producers for CoT though)". The pre-refactor Zenoh rows
+        // used a semicolon-joined 'endpoint;keyPrefix' shoved into
+        // 'target' -- that shape can't be safely round-tripped to the
+        // new rich schema (no transport, no org, no TLS material). So
+        // we drop pre-refactor Zenoh rows outright and let the
+        // operator re-create them via the new dialog. Non-Zenoh rows
+        // (UDP unicast/multicast, TCP server) are preserved verbatim.
+        boolean isNewSchemaZenoh = (type == Connector.Type.ZENOH)
+                && m.containsKey("zenohEndpoint");
+        if (type == Connector.Type.ZENOH && !isNewSchemaZenoh) {
+            System.err.println("[connector-store] dropping legacy Zenoh row id="
+                    + id + " (pre-refactor shape; re-create via the new dialog)");
+            return null;
+        }
+
+        // target is unused for ZENOH under the new schema; coerce to
+        // empty string so the record ctor doesn't NPE. For other types
+        // target is still required -- reject the row if missing.
+        if (type != Connector.Type.ZENOH && target == null) return null;
+        if (target == null) target = "";
+
+        PayloadFormat pay;
+        try { pay = PayloadFormat.valueOf(payStr); }
+        catch (IllegalArgumentException e) {
+            System.err.println("[connector-store] skipping malformed payload id=" + id + ": " + e);
+            return null;
+        }
+
+        // Zenoh-only fields; null on non-Zenoh rows.
+        ZenohTransport transport = (type == Connector.Type.ZENOH)
+                ? ZenohTransport.parseOrDefault(m.get("zenohTransport"), ZenohTransport.TCP)
+                : null;
+        String endpoint       = m.get("zenohEndpoint");
+        String org            = m.get("zenohOrg");
+        String keyExpr        = m.get("zenohKeyExpr");
+        String clientCertPath = m.get("zenohClientCertPath");
+        String clientKeyPath  = m.get("zenohClientKeyPath");
+        String rootCaPath     = m.get("zenohRootCaPath");
+        boolean verifyHost    = Boolean.parseBoolean(
+                m.getOrDefault("zenohVerifyHostname", "false"));
+
         try {
-            return new Connector(id, name,
-                    Connector.Type.valueOf(typeStr),
-                    target,
-                    PayloadFormat.valueOf(payStr),
+            return new Connector(id, name, type, target, pay,
                     ZenohMode.parseOrDefault(modeStr),   // null/unknown -> PER_AIRCRAFT
-                    Boolean.parseBoolean(enabled == null ? "false" : enabled));
+                    Boolean.parseBoolean(enabled == null ? "false" : enabled),
+                    transport, endpoint, org, keyExpr,
+                    clientCertPath, clientKeyPath, rootCaPath, verifyHost);
         } catch (IllegalArgumentException e) {
             System.err.println("[connector-store] skipping malformed connector id=" + id + ": " + e);
             return null;

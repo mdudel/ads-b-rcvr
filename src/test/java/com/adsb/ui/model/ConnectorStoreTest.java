@@ -92,77 +92,112 @@ class ConnectorStoreTest {
     }
 
     @Test
-    void zenoh_mode_round_trips_through_save_and_load(@TempDir Path dir) throws Exception {
+    void zenoh_new_schema_round_trips_through_save_and_load(@TempDir Path dir) throws Exception {
+        // Post-2026-07-29-refactor: Zenoh connectors use the rich-form
+        // fields (transport / endpoint / org / keyExpr / TLS material)
+        // instead of a semicolon-joined target. Every field must survive
+        // save/load unchanged.
         Path f = dir.resolve("mode.properties");
         ConnectorStore a = new ConnectorStore(f);
 
-        Connector stream = Connector.newInstance("Zenoh Stream",
-                Connector.Type.ZENOH,
-                "tcp/localhost:7447;adsb",
-                PayloadFormat.COT,
-                ZenohMode.STREAM,
-                true);
-        Connector fanout = Connector.newInstance("Zenoh Fan-out",
-                Connector.Type.ZENOH,
-                "tcp/localhost:7447;adsb/cot",
-                PayloadFormat.COT,
-                ZenohMode.PER_AIRCRAFT,
-                true);
+        Connector stream = Connector.newZenoh("Zenoh Stream",
+                ZenohTransport.TCP, "localhost:7447",
+                "", "adsb",
+                PayloadFormat.COT, ZenohMode.STREAM,
+                null, null, null, false, true);
+        Connector tls = Connector.newZenoh("Zenoh mTLS",
+                ZenohTransport.TLS, "100.64.165.203:7447",
+                "goatnet", "tracks/adsb",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                "/tmp/client.pem", "/tmp/client.key", "/tmp/ca.pem",
+                false, true);
         a.add(stream);
-        a.add(fanout);
+        a.add(tls);
         a.save();
 
         ConnectorStore b = new ConnectorStore(f);
         b.load();
-        assertEquals(ZenohMode.STREAM,       b.get(stream.id()).zenohMode(),
-                "STREAM mode must survive save/load round-trip");
-        assertEquals(ZenohMode.PER_AIRCRAFT, b.get(fanout.id()).zenohMode(),
-                "PER_AIRCRAFT mode must survive save/load round-trip");
+
+        Connector s = b.get(stream.id());
+        assertNotNull(s, "stream connector must round-trip");
+        assertEquals(ZenohTransport.TCP, s.zenohTransport());
+        assertEquals("localhost:7447", s.zenohEndpoint());
+        assertEquals("adsb", s.zenohKeyExpr());
+        assertEquals(ZenohMode.STREAM, s.zenohMode());
+
+        Connector t = b.get(tls.id());
+        assertNotNull(t, "TLS connector must round-trip");
+        assertEquals(ZenohTransport.TLS, t.zenohTransport());
+        assertEquals("100.64.165.203:7447", t.zenohEndpoint());
+        assertEquals("goatnet", t.zenohOrg());
+        assertEquals("tracks/adsb", t.zenohKeyExpr());
+        assertEquals("/tmp/client.pem", t.zenohClientCertPath());
+        assertEquals("/tmp/client.key", t.zenohClientKeyPath());
+        assertEquals("/tmp/ca.pem", t.zenohRootCaPath());
+        assertFalse(t.zenohVerifyHostname());
+        assertEquals(ZenohMode.PER_AIRCRAFT, t.zenohMode());
     }
 
     @Test
-    void pre_mode_properties_file_loads_with_per_aircraft_default(@TempDir Path dir) throws Exception {
-        // A properties file written by commit 8e4aca2 (initial Zenoh sink,
-        // before ZenohMode was persisted) has no connector.<id>.zenohMode key.
-        // Loader must default to PER_AIRCRAFT so the operator's shipping
-        // behaviour is preserved without any manual migration.
-        Path f = dir.resolve("pre-mode.properties");
+    void legacy_zenoh_rows_are_dropped_udp_rows_preserved(@TempDir Path dir) throws Exception {
+        // Marty 2026-07-29 14:01 UTC: "Nuke and fresh start (keep the
+        // UDP producers for CoT though)". A properties file with the
+        // pre-refactor Zenoh shape (semicolon-joined 'target' string,
+        // no zenohEndpoint key) is intentionally dropped. Non-Zenoh
+        // rows (UDP unicast/multicast, TCP server) are preserved so
+        // the operator's shipping CoT-over-UDP pipeline keeps working.
+        Path f = dir.resolve("mixed-legacy.properties");
         java.nio.file.Files.writeString(f, String.join("\n",
-                "connector.abc.name=Legacy Zenoh",
+                // Legacy Zenoh -- MUST be dropped
+                "connector.legacy-zenoh.name=Old Zenoh",
+                "connector.legacy-zenoh.type=ZENOH",
+                "connector.legacy-zenoh.target=tcp/localhost:7447;adsb/cot",
+                "connector.legacy-zenoh.payload=COT",
+                "connector.legacy-zenoh.enabled=true",
+                // UDP row -- MUST survive
+                "connector.udp-cop.name=Ops COP",
+                "connector.udp-cop.type=UDP_UNICAST",
+                "connector.udp-cop.target=239.2.3.1:6969",
+                "connector.udp-cop.payload=COT",
+                "connector.udp-cop.enabled=true",
+                ""));
+        ConnectorStore s = new ConnectorStore(f);
+        s.load();
+        assertNull(s.get("legacy-zenoh"),
+                "legacy Zenoh row must be dropped (Marty 2026-07-29: nuke & fresh start)");
+        Connector udp = s.get("udp-cop");
+        assertNotNull(udp, "non-Zenoh row must be preserved");
+        assertEquals(Connector.Type.UDP_UNICAST, udp.type());
+        assertEquals("239.2.3.1:6969", udp.target());
+        assertEquals(PayloadFormat.COT, udp.payload());
+    }
+
+    @Test
+    void new_schema_zenoh_row_with_zenohEndpoint_key_is_kept(@TempDir Path dir) throws Exception {
+        // The dropping heuristic is 'ZENOH row without zenohEndpoint key'
+        // -- rows written by the new schema always have that key so they
+        // pass through. Pinning this so a future refactor doesn't
+        // accidentally drop rows the operator just saved from the new
+        // dialog.
+        Path f = dir.resolve("new-schema.properties");
+        java.nio.file.Files.writeString(f, String.join("\n",
+                "connector.abc.name=New Zenoh",
                 "connector.abc.type=ZENOH",
-                "connector.abc.target=tcp/localhost:7447;adsb/cot",
+                "connector.abc.target=",
                 "connector.abc.payload=COT",
-                // deliberately NO zenohMode key
+                "connector.abc.zenohMode=PER_AIRCRAFT",
                 "connector.abc.enabled=true",
+                "connector.abc.zenohTransport=TCP",
+                "connector.abc.zenohEndpoint=localhost:7447",
+                "connector.abc.zenohKeyExpr=adsb/cot",
                 ""));
         ConnectorStore s = new ConnectorStore(f);
         s.load();
         Connector c = s.get("abc");
-        assertNotNull(c, "pre-mode connector must load, not be dropped");
-        assertEquals(ZenohMode.PER_AIRCRAFT, c.zenohMode(),
-                "missing zenohMode property must default to PER_AIRCRAFT for backward compat");
-    }
-
-    @Test
-    void unknown_zenoh_mode_string_falls_back_to_per_aircraft(@TempDir Path dir) throws Exception {
-        // A future rename or a hand-edited file might contain an unknown
-        // enum name. Loader must not throw or drop the record -- fall
-        // back to PER_AIRCRAFT so the connector is still usable.
-        Path f = dir.resolve("unknown-mode.properties");
-        java.nio.file.Files.writeString(f, String.join("\n",
-                "connector.abc.name=Hand-edited Zenoh",
-                "connector.abc.type=ZENOH",
-                "connector.abc.target=tcp/localhost:7447;adsb/cot",
-                "connector.abc.payload=COT",
-                "connector.abc.zenohMode=SOMETHING_WEIRD",
-                "connector.abc.enabled=true",
-                ""));
-        ConnectorStore s = new ConnectorStore(f);
-        s.load();
-        Connector c = s.get("abc");
-        assertNotNull(c);
-        assertEquals(ZenohMode.PER_AIRCRAFT, c.zenohMode(),
-                "unknown zenohMode enum name must fall back to PER_AIRCRAFT");
+        assertNotNull(c, "new-schema Zenoh row (has zenohEndpoint) must be kept");
+        assertEquals(ZenohTransport.TCP, c.zenohTransport());
+        assertEquals("localhost:7447", c.zenohEndpoint());
+        assertEquals("adsb/cot", c.zenohKeyExpr());
     }
 
     @Test
