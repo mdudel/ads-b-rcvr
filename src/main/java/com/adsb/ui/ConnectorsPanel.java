@@ -145,25 +145,25 @@ public final class ConnectorsPanel extends JPanel {
     /**
      * Build one card for a connector.
      *
-     * <p><b>Layout</b> (post-2026-07-29 15:56 UTC fix):
+     * <p><b>Layout</b> (post-2026-07-29 16:05 UTC fix):
      * <pre>
-     *   +---------------------------------------+-------------------+
-     *   | ● Name                    [S] [E] [R] |  (buttons NORTH,  |
-     *   | Type -> long/topic/here [COT] <mode>  |   info CENTER)    |
-     *   +---------------------------------------+-------------------+
+     *   +--------------------------------------------------+
+     *   | [Stop] [Edit\u2026] [Remove]  ● Name                    |  (buttons first,
+     *   |                       Type -> long/topic [COT]   |   info stretches)
+     *   +--------------------------------------------------+
      * </pre>
      *
-     * <p>The buttons sit at BorderLayout.NORTH-EAST inside a fixed-
-     * width right column so a very long Zenoh topic on the info label
-     * can't ever squeeze them off the right edge (which is what Marty
-     * hit at 15:56 UTC: long topic pushed the FlowLayout button strip
-     * out of the visible viewport). The info label is bounded by
-     * setPreferredSize based on the row's available width so its
-     * HTML re-wraps within the card instead of asking for infinite
-     * horizontal real estate.
+     * <p>Marty's 15:56 UTC screenshot showed the previous 'buttons on
+     * the far right' shape: buttons WERE visible but got shoved to
+     * the edge of the SideDock with lots of dead space between them
+     * and the info text. On a narrower panel that dead space would
+     * still let the info label push the buttons off-screen. Fix:
+     * put the buttons FIRST (left side, right after the border) and
+     * let the info label take whatever's left. Buttons are never
+     * clipped no matter how wide the info wants to be.
      */
     private JPanel buildRow(Connector c) {
-        // --- Buttons (fixed width right column) ---
+        // --- Buttons (left side, always visible) ---
         JButton toggleBtn = new JButton(c.enabled() ? "Stop" : "Start");
         toggleBtn.setForeground(c.enabled() ? new Color(0xC0, 0x39, 0x2B) : new Color(0x27, 0xAE, 0x60));
         toggleBtn.setFocusable(false);
@@ -180,63 +180,48 @@ public final class ConnectorsPanel extends JPanel {
         removeBtn.setFocusable(false);
         removeBtn.addActionListener(e -> onRemove(c));
 
-        JPanel buttonStrip = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
+        JPanel buttonStrip = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         buttonStrip.setOpaque(false);
         buttonStrip.add(toggleBtn);
         buttonStrip.add(editBtn);
         buttonStrip.add(removeBtn);
-        // Pin the strip's preferred + minimum size so it always claims
-        // exactly what its buttons need -- BorderLayout.EAST would give
-        // it the same behaviour but wouldn't cap the info label's grow.
+        // Pin the strip's size so BorderLayout.WEST always gives it
+        // exactly its natural width -- the info label in CENTER gets
+        // whatever's left, no more no less.
         Dimension stripPref = buttonStrip.getPreferredSize();
         buttonStrip.setMinimumSize(stripPref);
         buttonStrip.setPreferredSize(stripPref);
+        buttonStrip.setMaximumSize(stripPref);
 
-        // --- Info label (bounded width, HTML wraps) ---
-        // Wrap the HTML in a fixed-width <body> so long Zenoh topics wrap
-        // onto a second line instead of asking for infinite horizontal
-        // real estate. Body-width is the classic Swing HTML idiom for
-        // bounded wrapping (a <div style=width> doesn't affect
-        // preferredSize computation).
-        //
-        // The bound is deliberately generous (900 px) so short labels
-        // don't wrap on wide windows. The row cap below is what actually
-        // prevents the card from exceeding the panel width.
+        // --- Info label (bounded width, HTML wraps if needed) ---
+        // Body-width bound (900 px) is generous so short labels don't
+        // wrap on wide windows. Row cap below limits the actual growth.
         JLabel info = new JLabel(renderInfoWrapped(c, 900));
         info.setToolTipText(tooltipFor(c));
-        info.setVerticalAlignment(JLabel.TOP);
-        // JLabel with HTML content defaults to preferredSize == natural
-        // width, so we have to give it setMinimumSize(0,0) to allow
-        // BorderLayout to squeeze it below the natural width when the
-        // row is narrower than the label wants. Without this, the label
-        // pushes the button strip out of the visible area (which is the
-        // exact bug Marty reported at 15:56 UTC).
+        info.setVerticalAlignment(JLabel.CENTER);
+        info.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 4));
+        // Allow BorderLayout to squeeze the label below its natural
+        // width when the row is narrower than the label wants -- HTML
+        // content re-wraps automatically. Without this the label
+        // pushes past the visible area.
         info.setMinimumSize(new Dimension(0, 0));
 
         // --- Card assembly ---
-        JPanel row = new JPanel(new BorderLayout(8, 4));
+        JPanel row = new JPanel(new BorderLayout(4, 4));
         row.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(borderColorFor(c), 1, true),
                 BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+        row.add(buttonStrip, BorderLayout.WEST);   // <-- WAS EAST; buttons first
         row.add(info,        BorderLayout.CENTER);
-        row.add(buttonStrip, BorderLayout.EAST);
 
-        // Cap the row's maximumSize width so BoxLayout doesn't grow the
-        // card beyond the viewport just because the info label wants
-        // more room. Height cap keeps a card from being stretched to
-        // fill the viewport when the list is short.
         row.setAlignmentX(LEFT_ALIGNMENT);
         Dimension pref = row.getPreferredSize();
-        // Preferred width is the button-strip width + a modest
-        // information column; the panel resizer + revalidateOnResize
-        // hook lets the label re-wrap as the window is resized.
+        // Height cap: prevent BoxLayout from stretching one card to
+        // fill the viewport when the list is short.
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, pref.height + 4));
-        // preferredSize width doesn't matter for BoxLayout Y_AXIS (it
-        // uses the alignment axis for stretching), but pinning min
-        // avoids the pack() sizing the SideDock to the full 900 px
-        // body-width. The 240 px min covers just the button strip.
-        Dimension bsPref = buttonStrip.getPreferredSize();
-        row.setMinimumSize(new Dimension(bsPref.width + 40, pref.height));
+        // Width min: enough to guarantee the button strip fits even
+        // when the SideDock is dragged narrow.
+        row.setMinimumSize(new Dimension(stripPref.width + 40, pref.height));
 
         // Double-click the info label opens Edit -- keeps the classic
         // shortcut the JList had.
