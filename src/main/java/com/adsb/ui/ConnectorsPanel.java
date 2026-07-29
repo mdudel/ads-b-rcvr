@@ -5,16 +5,16 @@ import com.adsb.ui.model.Connector;
 import com.adsb.ui.model.ConnectorAttacher;
 import com.adsb.ui.model.ConnectorStore;
 import com.adsb.ui.model.ZenohMode;
+import com.adsb.ui.model.ZenohTransport;
 
 import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
 import javax.swing.DefaultListCellRenderer;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JDialog;
+import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JOptionPane;
@@ -26,10 +26,12 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
-import java.awt.Frame;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.io.File;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * The Connectors dock: shows every configured {@link Connector},
@@ -46,6 +48,16 @@ import java.awt.Insets;
  * so the properties file always mirrors the UI. Save errors surface
  * as a dialog; the in-memory list is not rolled back (matches
  * {@link ConnectorStore#save()} contract).
+ *
+ * <p><b>Zenoh sub-form</b> (added 2026-07-29 for Marty's rich Zenoh
+ * connector work): when the type dropdown is set to ZENOH, the
+ * generic "Target" line hides and a dedicated grid appears with
+ * dropdown Transport, separate Endpoint / Root topic / Topic fields,
+ * three Browse-button rows for the TLS material, and a Verify-host
+ * checkbox. TLS rows grey out when the transport is TCP/WS.
+ * "Last-used cert dir" is remembered in the properties file via
+ * {@link #lastCertDirRef} so repeated Browse clicks don't force the
+ * operator to re-navigate to their PEM stash.
  */
 public final class ConnectorsPanel extends JPanel {
 
@@ -54,10 +66,35 @@ public final class ConnectorsPanel extends JPanel {
     private final DefaultListModel<Connector> listModel = new DefaultListModel<>();
     private final JList<Connector>   list;
 
+    /**
+     * Mutable ref holding the last directory a Browse button visited.
+     * Persisted by the Main bootstrap under {@code ui.lastCertDir} so
+     * it survives restarts. Nullable when nothing has been remembered
+     * yet.
+     */
+    private final Supplier<String>   lastCertDirRef;
+    private final Consumer<String>   lastCertDirSetter;
+
+    /** 2-arg ctor for tests / minimal callers (no cert-dir persistence). */
     public ConnectorsPanel(ConnectorStore store, ConnectorAttacher attacher) {
+        this(store, attacher, () -> null, s -> {});
+    }
+
+    /**
+     * @param lastCertDirRef supplier that returns the last dir a Browse
+     *                       button visited (may return null).
+     * @param lastCertDirSetter setter called whenever a Browse button
+     *                          commits a new directory; typical impl
+     *                          persists to the properties file.
+     */
+    public ConnectorsPanel(ConnectorStore store, ConnectorAttacher attacher,
+                           Supplier<String> lastCertDirRef,
+                           Consumer<String> lastCertDirSetter) {
         super(new BorderLayout(4, 4));
         this.store = store;
         this.attacher = attacher;
+        this.lastCertDirRef    = lastCertDirRef    == null ? () -> null : lastCertDirRef;
+        this.lastCertDirSetter = lastCertDirSetter == null ? s -> {}    : lastCertDirSetter;
 
         setBorder(BorderFactory.createEmptyBorder(6, 6, 6, 6));
 
@@ -108,7 +145,7 @@ public final class ConnectorsPanel extends JPanel {
     // ------------------------------------------------------------------
 
     private void onAdd() {
-        Connector c = ConnectorEditDialog.showFor(this, null);
+        Connector c = ConnectorEditDialog.showFor(this, null, lastCertDirRef, lastCertDirSetter);
         if (c == null) return;
         store.add(c);
         persistThen(() -> attach(c));
@@ -117,7 +154,7 @@ public final class ConnectorsPanel extends JPanel {
     private void onEdit() {
         Connector sel = list.getSelectedValue();
         if (sel == null) return;
-        Connector edited = ConnectorEditDialog.showFor(this, sel);
+        Connector edited = ConnectorEditDialog.showFor(this, sel, lastCertDirRef, lastCertDirSetter);
         if (edited == null) return;
         boolean wasAttached = sel.enabled() && sel.type().isImplemented();
         store.update(edited);
@@ -192,22 +229,33 @@ public final class ConnectorsPanel extends JPanel {
             super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
             if (value instanceof Connector c) {
                 String status = c.enabled() ? "\u25cf" : "\u25cb";
-                // Show the Zenoh mode inline on Zenoh rows so the
-                // operator can tell stream-vs-fan-out apart at a glance.
-                // Suppressed for other types where the field is dead weight.
+                // For Zenoh rows the 'target' is empty; render the
+                // richer field set inline so the operator can see at
+                // a glance what's configured.
+                String targetDisplay = (c.type() == Connector.Type.ZENOH)
+                        ? renderZenohTarget(c)
+                        : escape(c.target());
                 String zenohHint = (c.type() == Connector.Type.ZENOH)
                         ? "&nbsp;&nbsp;<i>" + c.zenohMode().label() + "</i>"
                         : "";
                 setText("<html><b>" + status + " " + escape(c.name()) + "</b>"
                         + "<br><small>" + c.type().label()
-                        + " \u2192 " + escape(c.target())
+                        + " \u2192 " + targetDisplay
                         + "&nbsp;&nbsp;[" + c.payload() + "]"
                         + zenohHint
                         + "</small></html>");
             }
             return this;
         }
+        private static String renderZenohTarget(Connector c) {
+            String scheme = c.zenohTransport() == null ? "tcp" : c.zenohTransport().scheme();
+            String ep = c.zenohEndpoint() == null ? "?" : c.zenohEndpoint();
+            String key = c.zenohKeyExpr() == null ? "?" : c.zenohKeyExpr();
+            String org = (c.zenohOrg() == null || c.zenohOrg().isBlank()) ? "" : (c.zenohOrg() + "/");
+            return escape(scheme + "/" + ep + "  \u2192  " + org + key);
+        }
         private static String escape(String s) {
+            if (s == null) return "";
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
         }
     }
@@ -219,8 +267,13 @@ public final class ConnectorsPanel extends JPanel {
     static final class ConnectorEditDialog {
 
         /** @return the new/edited connector, or null if the operator cancelled. */
-        static Connector showFor(Component owner, Connector existing) {
-            JTextField nameField   = new JTextField(existing == null ? "" : existing.name(), 20);
+        static Connector showFor(Component owner, Connector existing,
+                                 Supplier<String> lastCertDirRef,
+                                 Consumer<String> lastCertDirSetter) {
+
+            // Shared (all-types) fields ------------------------------------
+            JTextField nameField = new JTextField(existing == null ? "" : existing.name(), 20);
+
             JComboBox<Connector.Type> typeBox = new JComboBox<>(Connector.Type.values());
             typeBox.setRenderer(new DefaultListCellRenderer() {
                 @Override public Component getListCellRendererComponent(
@@ -235,14 +288,12 @@ public final class ConnectorsPanel extends JPanel {
             });
             if (existing != null) typeBox.setSelectedItem(existing.type());
 
-            JTextField targetField  = new JTextField(existing == null ? "" : existing.target(), 20);
+            JTextField targetField = new JTextField(
+                    existing == null ? "" : (existing.target() == null ? "" : existing.target()), 20);
+
             JComboBox<PayloadFormat> payBox = new JComboBox<>(PayloadFormat.values());
             if (existing != null) payBox.setSelectedItem(existing.payload());
 
-            // Zenoh-only field: key-layout mode. Rendered on every form so
-            // the layout is stable across type changes, but enabled only
-            // for ZENOH; the operator gets a visual cue that the mode
-            // is a Zenoh property, not a global one.
             JComboBox<ZenohMode> zenohModeBox = new JComboBox<>(ZenohMode.values());
             zenohModeBox.setRenderer(new DefaultListCellRenderer() {
                 @Override public Component getListCellRendererComponent(
@@ -258,57 +309,176 @@ public final class ConnectorsPanel extends JPanel {
             JCheckBox enabledBox = new JCheckBox("Enabled",
                     existing == null || existing.enabled());
 
-            // Live per-type hint so users know what the target format is.
+            // Zenoh-specific fields ----------------------------------------
+            JComboBox<ZenohTransport> zenohTransportBox = new JComboBox<>(ZenohTransport.values());
+            zenohTransportBox.setRenderer(new DefaultListCellRenderer() {
+                @Override public Component getListCellRendererComponent(
+                        JList<?> l, Object v, int i, boolean sel, boolean focus) {
+                    super.getListCellRendererComponent(l, v, i, sel, focus);
+                    if (v instanceof ZenohTransport t) {
+                        setText(t.name() + "  \u2014  " + t.description());
+                    }
+                    return this;
+                }
+            });
+            zenohTransportBox.setSelectedItem(existing != null && existing.zenohTransport() != null
+                    ? existing.zenohTransport() : ZenohTransport.TCP);
+
+            JTextField zenohEndpointField = new JTextField(
+                    existing != null && existing.zenohEndpoint() != null
+                            ? existing.zenohEndpoint() : "", 20);
+            JTextField zenohOrgField = new JTextField(
+                    existing != null && existing.zenohOrg() != null
+                            ? existing.zenohOrg() : "", 20);
+            JTextField zenohTopicField = new JTextField(
+                    existing != null && existing.zenohKeyExpr() != null
+                            ? existing.zenohKeyExpr() : "", 20);
+
+            JTextField zenohCertField = new JTextField(
+                    existing != null && existing.zenohClientCertPath() != null
+                            ? existing.zenohClientCertPath() : "", 20);
+            JTextField zenohKeyField = new JTextField(
+                    existing != null && existing.zenohClientKeyPath() != null
+                            ? existing.zenohClientKeyPath() : "", 20);
+            JTextField zenohCaField = new JTextField(
+                    existing != null && existing.zenohRootCaPath() != null
+                            ? existing.zenohRootCaPath() : "", 20);
+            JButton zenohCertBrowse = browseButton(owner, zenohCertField,
+                    "Choose TLS client certificate PEM", lastCertDirRef, lastCertDirSetter);
+            JButton zenohKeyBrowse  = browseButton(owner, zenohKeyField,
+                    "Choose TLS client private key PEM", lastCertDirRef, lastCertDirSetter);
+            JButton zenohCaBrowse   = browseButton(owner, zenohCaField,
+                    "Choose CA / truststore PEM",       lastCertDirRef, lastCertDirSetter);
+
+            JCheckBox zenohVerifyBox = new JCheckBox("Verify TLS hostname",
+                    existing != null && existing.zenohVerifyHostname());
+            zenohVerifyBox.setToolTipText("Leave unchecked for IP endpoints (Tailscale / CGNAT); "
+                    + "check when connecting to a real DNS name that appears in the server cert SAN");
+
+            JLabel zenohPreviewLabel = new JLabel(" ");
+            zenohPreviewLabel.setFont(zenohPreviewLabel.getFont().deriveFont(java.awt.Font.ITALIC, 11f));
+
+            // Live target-hint (used only for non-Zenoh types)
             JLabel targetHint = new JLabel(" ");
             targetHint.setFont(targetHint.getFont().deriveFont(java.awt.Font.ITALIC, 11f));
-            Runnable syncHint = () -> {
-                Connector.Type t = (Connector.Type) typeBox.getSelectedItem();
-                switch (t) {
-                    case UDP_UNICAST:   targetHint.setText("host:port  \u2014 e.g. 192.168.1.50:6969"); break;
-                    case UDP_MULTICAST: targetHint.setText("group:port  \u2014 e.g. 239.2.3.1:6969"); break;
-                    case TCP_SERVER:    targetHint.setText("port  \u2014 e.g. 30003"); break;
-                    case ZENOH:         targetHint.setText("endpoint;key-prefix  \u2014 e.g. tcp/localhost:7447;adsb/cot"); break;
-                }
-            };
-            typeBox.addActionListener(e -> syncHint.run());
-            syncHint.run();
 
-            // Zenoh mode row is only meaningful when type == ZENOH. Kept
-            // visible always so the form geometry is stable, but disabled
-            // (grayed) when the selected type doesn't use it. Same UX
-            // convention as the OK button's isImplemented() gating.
-            Runnable syncModeEnabled = () -> {
-                Connector.Type t = (Connector.Type) typeBox.getSelectedItem();
-                boolean isZenoh = (t == Connector.Type.ZENOH);
-                zenohModeBox.setEnabled(isZenoh);
-                zenohModeBox.setToolTipText(isZenoh
-                        ? "Stream = one topic for everything; Per aircraft = separate topic per ICAO for CoT"
-                        : "Zenoh-only setting; ignored for " + t.label());
-            };
-            typeBox.addActionListener(e -> syncModeEnabled.run());
-            syncModeEnabled.run();
-
+            // -----------------------------------------------------------------
+            // Form layout: two rows of shared fields, then either the
+            // generic Target/hint row (non-Zenoh) or the Zenoh sub-form.
+            // Both variants render into the same form panel with the
+            // non-applicable rows hidden -- lets the dialog size stay
+            // stable and the user's brain not jump.
+            // -----------------------------------------------------------------
             JPanel form = new JPanel(new GridBagLayout());
             form.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
             GridBagConstraints gc = new GridBagConstraints();
             gc.insets = new Insets(4, 4, 4, 4);
             gc.anchor = GridBagConstraints.WEST;
             gc.fill = GridBagConstraints.HORIZONTAL;
-            gc.gridx = 0; gc.gridy = 0;
 
-            form.add(new JLabel("Name:"),    gc); gc.gridx = 1; form.add(nameField,   gc);
-            gc.gridx = 0; gc.gridy++;
-            form.add(new JLabel("Type:"),    gc); gc.gridx = 1; form.add(typeBox,     gc);
-            gc.gridx = 0; gc.gridy++;
-            form.add(new JLabel("Target:"),  gc); gc.gridx = 1; form.add(targetField, gc);
-            gc.gridx = 1; gc.gridy++;             form.add(targetHint,  gc);
-            gc.gridx = 0; gc.gridy++;
-            form.add(new JLabel("Payload:"), gc); gc.gridx = 1; form.add(payBox,      gc);
-            gc.gridx = 0; gc.gridy++;
-            form.add(new JLabel("Zenoh mode:"), gc); gc.gridx = 1; form.add(zenohModeBox, gc);
-            gc.gridx = 1; gc.gridy++;             form.add(enabledBox,  gc);
+            int y = 0;
+            addRow(form, gc, y++, "Name:",    nameField);
+            addRow(form, gc, y++, "Type:",    typeBox);
 
-            // Custom dialog so we can gate OK on type.isImplemented().
+            // ----- generic Target row (visible only for non-Zenoh types)
+            JLabel   targetLabel = new JLabel("Target:");
+            addRow(form, gc, y++, targetLabel, targetField);
+            gc.gridx = 1; gc.gridy = y++; form.add(targetHint, gc);
+            final int genericTargetRowStart = 2;   // rows 2..3 host generic Target
+            final int genericTargetRowEnd   = 3;
+
+            // ----- Zenoh sub-form rows
+            int zStart = y;
+            JLabel lblTransport = new JLabel("Transport:");
+            addRow(form, gc, y++, lblTransport, zenohTransportBox);
+            JLabel lblEndpoint  = new JLabel("Endpoint (host:port):");
+            addRow(form, gc, y++, lblEndpoint,  zenohEndpointField);
+            JLabel lblOrg       = new JLabel("Root topic:");
+            addRow(form, gc, y++, lblOrg,       zenohOrgField);
+            JLabel lblTopic     = new JLabel("Topic:");
+            addRow(form, gc, y++, lblTopic,     zenohTopicField);
+            JLabel lblCert      = new JLabel("Client cert (PEM):");
+            addBrowseRow(form, gc, y++, lblCert, zenohCertField, zenohCertBrowse);
+            JLabel lblKey       = new JLabel("Client key (PEM):");
+            addBrowseRow(form, gc, y++, lblKey,  zenohKeyField,  zenohKeyBrowse);
+            JLabel lblCa        = new JLabel("Truststore CA (PEM):");
+            addBrowseRow(form, gc, y++, lblCa,   zenohCaField,   zenohCaBrowse);
+            gc.gridx = 1; gc.gridy = y++; form.add(zenohVerifyBox, gc);
+            gc.gridx = 1; gc.gridy = y++; form.add(zenohPreviewLabel, gc);
+            int zEnd = y - 1;
+
+            // ----- payload + mode + enabled (bottom shared block)
+            addRow(form, gc, y++, "Payload:",     payBox);
+            JLabel lblMode = new JLabel("Zenoh mode:");
+            addRow(form, gc, y++, lblMode,        zenohModeBox);
+            gc.gridx = 1; gc.gridy = y++; form.add(enabledBox, gc);
+
+            java.util.List<Component> genericRow = java.util.List.of(
+                    targetLabel, targetField, targetHint);
+            java.util.List<Component> zenohRows  = java.util.List.of(
+                    lblTransport, zenohTransportBox,
+                    lblEndpoint,  zenohEndpointField,
+                    lblOrg,       zenohOrgField,
+                    lblTopic,     zenohTopicField,
+                    lblCert,      zenohCertField, zenohCertBrowse,
+                    lblKey,       zenohKeyField,  zenohKeyBrowse,
+                    lblCa,        zenohCaField,   zenohCaBrowse,
+                    zenohVerifyBox, zenohPreviewLabel,
+                    lblMode,      zenohModeBox);
+            java.util.List<Component> tlsRows = java.util.List.of(
+                    lblCert, zenohCertField, zenohCertBrowse,
+                    lblKey,  zenohKeyField,  zenohKeyBrowse,
+                    lblCa,   zenohCaField,   zenohCaBrowse,
+                    zenohVerifyBox);
+
+            Runnable syncVisibility = () -> {
+                Connector.Type t = (Connector.Type) typeBox.getSelectedItem();
+                boolean isZenoh = (t == Connector.Type.ZENOH);
+                for (Component g : genericRow) g.setVisible(!isZenoh);
+                for (Component z : zenohRows)  z.setVisible(isZenoh);
+
+                // Grey out TLS rows for TCP / WS
+                if (isZenoh) {
+                    ZenohTransport zt = (ZenohTransport) zenohTransportBox.getSelectedItem();
+                    boolean tls = zt != null && zt.isTls();
+                    for (Component r : tlsRows) r.setEnabled(tls);
+                }
+
+                // Per-type hint for the generic target field
+                if (!isZenoh) {
+                    switch (t) {
+                        case UDP_UNICAST:   targetHint.setText("host:port  \u2014 e.g. 192.168.1.50:6969"); break;
+                        case UDP_MULTICAST: targetHint.setText("group:port  \u2014 e.g. 239.2.3.1:6969"); break;
+                        case TCP_SERVER:    targetHint.setText("port  \u2014 e.g. 30003"); break;
+                        default:            targetHint.setText(" ");
+                    }
+                }
+                // Live Zenoh preview
+                if (isZenoh) {
+                    ZenohTransport zt = (ZenohTransport) zenohTransportBox.getSelectedItem();
+                    String ep = zenohEndpointField.getText().trim();
+                    String org = zenohOrgField.getText().trim();
+                    String topic = zenohTopicField.getText().trim();
+                    String fullKey = org.isEmpty() ? topic : (org + "/" + topic);
+                    zenohPreviewLabel.setText("<html>\u2192 <tt>"
+                            + (zt == null ? "tcp" : zt.scheme()) + "/" + (ep.isEmpty() ? "?" : ep)
+                            + "</tt>  publishes under  <tt>" + (fullKey.isEmpty() ? "?" : fullKey)
+                            + "</tt></html>");
+                }
+                form.revalidate();
+                form.repaint();
+                Component top = SwingUtilities.getWindowAncestor(form);
+                if (top instanceof java.awt.Window w) w.pack();
+            };
+            typeBox.addActionListener(e -> syncVisibility.run());
+            zenohTransportBox.addActionListener(e -> syncVisibility.run());
+            SimpleDocListener liveSync = new SimpleDocListener(syncVisibility);
+            zenohEndpointField.getDocument().addDocumentListener(liveSync);
+            zenohOrgField.getDocument().addDocumentListener(liveSync);
+            zenohTopicField.getDocument().addDocumentListener(liveSync);
+
+            // Custom dialog so we can gate OK on type.isImplemented()
+            // AND on Zenoh-required fields.
             JOptionPane pane = new JOptionPane(form,
                     JOptionPane.PLAIN_MESSAGE, JOptionPane.OK_CANCEL_OPTION);
             JDialog dialog = pane.createDialog(owner,
@@ -318,9 +488,23 @@ public final class ConnectorsPanel extends JPanel {
                 Connector.Type t = (Connector.Type) typeBox.getSelectedItem();
                 for (Object o : findButtons(pane)) {
                     if (o instanceof JButton b && "OK".equals(b.getText())) {
-                        b.setEnabled(t.isImplemented()
-                                && !nameField.getText().trim().isEmpty()
-                                && !targetField.getText().trim().isEmpty());
+                        boolean ok = t.isImplemented()
+                                && !nameField.getText().trim().isEmpty();
+                        if (t == Connector.Type.ZENOH) {
+                            ok = ok
+                                    && !zenohEndpointField.getText().trim().isEmpty()
+                                    && !zenohTopicField.getText().trim().isEmpty();
+                            ZenohTransport zt = (ZenohTransport) zenohTransportBox.getSelectedItem();
+                            if (zt != null && zt.isTls()) {
+                                ok = ok
+                                        && !zenohCertField.getText().trim().isEmpty()
+                                        && !zenohKeyField.getText().trim().isEmpty()
+                                        && !zenohCaField.getText().trim().isEmpty();
+                            }
+                        } else {
+                            ok = ok && !targetField.getText().trim().isEmpty();
+                        }
+                        b.setEnabled(ok);
                         b.setToolTipText(t.isImplemented()
                                 ? null
                                 : "This connector type is scaffolded but not yet wired");
@@ -328,10 +512,22 @@ public final class ConnectorsPanel extends JPanel {
                 }
             };
             typeBox.addActionListener(e -> syncOk.run());
-            nameField.getDocument().addDocumentListener(new SimpleDocListener(syncOk));
-            targetField.getDocument().addDocumentListener(new SimpleDocListener(syncOk));
-            SwingUtilities.invokeLater(syncOk);
+            zenohTransportBox.addActionListener(e -> syncOk.run());
+            SimpleDocListener okSync = new SimpleDocListener(syncOk);
+            nameField.getDocument().addDocumentListener(okSync);
+            targetField.getDocument().addDocumentListener(okSync);
+            zenohEndpointField.getDocument().addDocumentListener(okSync);
+            zenohTopicField.getDocument().addDocumentListener(okSync);
+            zenohCertField.getDocument().addDocumentListener(okSync);
+            zenohKeyField.getDocument().addDocumentListener(okSync);
+            zenohCaField.getDocument().addDocumentListener(okSync);
+            SwingUtilities.invokeLater(() -> {
+                syncVisibility.run();
+                syncOk.run();
+            });
 
+            dialog.setPreferredSize(new Dimension(560, dialog.getPreferredSize().height));
+            dialog.pack();
             dialog.setVisible(true);
             Object result = pane.getValue();
             dialog.dispose();
@@ -339,20 +535,40 @@ public final class ConnectorsPanel extends JPanel {
                 return null;
             }
 
-            String name    = nameField.getText().trim();
-            Connector.Type type    = (Connector.Type) typeBox.getSelectedItem();
-            String target  = targetField.getText().trim();
+            String name = nameField.getText().trim();
+            Connector.Type type = (Connector.Type) typeBox.getSelectedItem();
             PayloadFormat pay = (PayloadFormat) payBox.getSelectedItem();
             ZenohMode mode = (ZenohMode) zenohModeBox.getSelectedItem();
             boolean enabled = enabledBox.isSelected();
 
+            if (type == Connector.Type.ZENOH) {
+                ZenohTransport zt = (ZenohTransport) zenohTransportBox.getSelectedItem();
+                String ep    = zenohEndpointField.getText().trim();
+                String org   = zenohOrgField.getText().trim();
+                String topic = zenohTopicField.getText().trim();
+                String cert  = zenohCertField.getText().trim();
+                String key   = zenohKeyField.getText().trim();
+                String ca    = zenohCaField.getText().trim();
+                boolean verify = zenohVerifyBox.isSelected();
+                if (existing == null) {
+                    return Connector.newZenoh(name, zt, ep, org, topic, pay, mode,
+                            emptyToNull(cert), emptyToNull(key), emptyToNull(ca),
+                            verify, enabled);
+                }
+                return new Connector(existing.id(), name, Connector.Type.ZENOH,
+                        "", pay, mode, enabled,
+                        zt, ep, org, topic,
+                        emptyToNull(cert), emptyToNull(key), emptyToNull(ca),
+                        verify);
+            }
+
+            String target = targetField.getText().trim();
             if (existing == null) {
                 return Connector.newInstance(name, type, target, pay, mode, enabled);
             }
-            // Preserve every field on the existing row that we don't
-            // touch here (Zenoh fields are edited in the Zenoh sub-form
-            // added in Phase 3; this legacy code path only handles the
-            // shared name/type/target/payload/mode/enabled group).
+            // Preserve every Zenoh field on the existing row that we don't
+            // touch here -- if the operator edited a UDP row that had
+            // stale null Zenoh fields, they stay null; nothing to lose.
             return new Connector(existing.id(), name, type, target, pay, mode, enabled,
                     existing.zenohTransport(),
                     existing.zenohEndpoint(),
@@ -362,6 +578,79 @@ public final class ConnectorsPanel extends JPanel {
                     existing.zenohClientKeyPath(),
                     existing.zenohRootCaPath(),
                     existing.zenohVerifyHostname());
+        }
+
+        // -------------------------------------------------------------
+        // helpers
+        // -------------------------------------------------------------
+
+        private static void addRow(JPanel form, GridBagConstraints gc, int y,
+                                   String labelText, Component field) {
+            addRow(form, gc, y, new JLabel(labelText), field);
+        }
+        private static void addRow(JPanel form, GridBagConstraints gc, int y,
+                                   JLabel label, Component field) {
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 1; form.add(label, gc);
+            gc.gridx = 1;                                  form.add(field, gc);
+        }
+        private static void addBrowseRow(JPanel form, GridBagConstraints gc, int y,
+                                          JLabel label, Component field, Component browse) {
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 1; form.add(label, gc);
+            JPanel row = new JPanel(new BorderLayout(4, 0));
+            row.add(field, BorderLayout.CENTER);
+            row.add(browse, BorderLayout.EAST);
+            gc.gridx = 1;                                  form.add(row, gc);
+        }
+
+        /**
+         * Build a "Browse..." button that opens a JFileChooser starting at
+         * the last-used cert dir (falling back to the current value of the
+         * target field, then user.home). On successful selection, populates
+         * the field and calls {@code lastCertDirSetter} so the choice
+         * survives the next Add/Edit.
+         */
+        private static JButton browseButton(Component owner, JTextField field, String title,
+                                            Supplier<String> lastCertDirRef,
+                                            Consumer<String> lastCertDirSetter) {
+            JButton b = new JButton("Browse\u2026");
+            b.setFocusable(false);
+            b.addActionListener(e -> {
+                JFileChooser fc = new JFileChooser();
+                fc.setDialogTitle(title);
+                // Start at existing field value if it points somewhere real,
+                // else the last-used cert dir, else user.home.
+                String cur = field.getText().trim();
+                if (!cur.isEmpty()) {
+                    File f = new File(cur);
+                    if (f.getParentFile() != null && f.getParentFile().isDirectory()) {
+                        fc.setCurrentDirectory(f.getParentFile());
+                    } else if (f.isDirectory()) {
+                        fc.setCurrentDirectory(f);
+                    }
+                } else {
+                    String last = lastCertDirRef.get();
+                    if (last != null && !last.isBlank()) {
+                        File d = new File(last);
+                        if (d.isDirectory()) fc.setCurrentDirectory(d);
+                    }
+                }
+                int rv = fc.showOpenDialog(owner);
+                if (rv == JFileChooser.APPROVE_OPTION) {
+                    File chosen = fc.getSelectedFile();
+                    if (chosen != null) {
+                        field.setText(chosen.getAbsolutePath());
+                        File parent = chosen.getParentFile();
+                        if (parent != null) lastCertDirSetter.accept(parent.getAbsolutePath());
+                    }
+                }
+            });
+            return b;
+        }
+
+        private static String emptyToNull(String s) {
+            if (s == null) return null;
+            String t = s.trim();
+            return t.isEmpty() ? null : t;
         }
 
         /** Walk the pane to find its OK/Cancel buttons so we can enable/disable OK. */

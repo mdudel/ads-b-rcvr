@@ -77,6 +77,18 @@ public final class MainFrame extends JFrame {
      *                     toolbar button (Marty 2026-07-29 11:28 UTC).
      *                     Nullable: when null, the Reconnect button is
      *                     hidden (headless smoke tests / non-UI paths).
+     * @param lastCertDirRef supplier of the last directory a Zenoh cert
+     *                     Browse button visited; nullable (defaults to
+     *                     'no memory'). Persistence lives in Main so
+     *                     the UI never touches the properties file.
+     * @param lastCertDirSetter setter called when a Browse button
+     *                     commits a new directory; nullable no-op if
+     *                     persistence isn't wired.
+     */
+    /**
+     * Legacy 12-arg convenience ctor for callers that don't need the
+     * lastCertDir persistence (tests, headless smoke). Defers to the
+     * full ctor with no-op supplier/setter.
      */
     public MainFrame(String version,
                      AircraftStateStore store,
@@ -89,6 +101,24 @@ public final class MainFrame extends JFrame {
                      ThemeMode initialTheme,
                      Consumer<ThemeMode> onThemeChanged,
                      AdsbReceiver receiver) {
+        this(version, store, connectorStore, attacher, liveBuilder,
+                initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                initialTheme, onThemeChanged, receiver, () -> null, s -> {});
+    }
+
+    public MainFrame(String version,
+                     AircraftStateStore store,
+                     ConnectorStore connectorStore,
+                     ConnectorAttacher attacher,
+                     AtomicReference<CoTBuilder> liveBuilder,
+                     IcaoAircraftClassifier.Affiliation initialAffil,
+                     IcaoAircraftClassifier.Category    initialCat,
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver,
+                     java.util.function.Supplier<String> lastCertDirRef,
+                     java.util.function.Consumer<String> lastCertDirSetter) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -116,7 +146,8 @@ public final class MainFrame extends JFrame {
 
         this.mapPanel         = new MapPanel(store);
         this.tracksPanel      = new TracksPanel(store, mapPanel::centerOn);
-        this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher);
+        this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher,
+                lastCertDirRef, lastCertDirSetter);
         this.settingsPanel    = new SettingsPanel(
                 initialAffil, initialCat, initialStaleAir, initialStaleGround,
                 (aff, cat, sa, sg) -> {

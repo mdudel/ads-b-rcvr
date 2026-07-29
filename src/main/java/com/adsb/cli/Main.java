@@ -205,7 +205,9 @@ public class Main {
                             cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds,
                             initialTheme,
                             newTheme -> writeThemeMode(storePath, newTheme),
-                            uiReceiverRef);
+                            uiReceiverRef,
+                            () -> readLastCertDir(storePath),
+                            dir -> writeLastCertDir(storePath, dir));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -344,6 +346,42 @@ public class Main {
     }
 
     private static void writeThemeMode(Path storePath, ThemeMode mode) {
+        writeUiProperty(storePath, "ui.themeMode", mode.canonical());
+    }
+
+    /**
+     * Read {@code ui.lastCertDir} from the shared properties file.
+     * Returns null when absent or the file is unreadable -- the caller
+     * (ConnectorsPanel) treats null as 'no remembered dir, start at
+     * user.home'.
+     */
+    private static String readLastCertDir(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return null;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            String v = p.getProperty("ui.lastCertDir");
+            return (v == null || v.isBlank()) ? null : v;
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.lastCertDir from "
+                    + storePath + ": " + e);
+            return null;
+        }
+    }
+
+    private static void writeLastCertDir(Path storePath, String dir) {
+        if (dir == null || dir.isBlank()) return;
+        writeUiProperty(storePath, "ui.lastCertDir", dir);
+    }
+
+    /**
+     * Shared helper: read-modify-write one UI property in the shared
+     * properties file. Atomic (tmp + rename). Silent WARN on failure
+     * so the UI never wedges on a disk error.
+     */
+    private static void writeUiProperty(Path storePath, String key, String value) {
         try {
             java.nio.file.Files.createDirectories(storePath.getParent());
             java.util.Properties p = new java.util.Properties();
@@ -352,7 +390,7 @@ public class Main {
                     p.load(in);
                 }
             }
-            p.setProperty("ui.themeMode", mode.canonical());
+            p.setProperty(key, value);
             java.nio.file.Path tmp = storePath.resolveSibling(
                     storePath.getFileName().toString() + ".tmp");
             try (var out = java.nio.file.Files.newBufferedWriter(tmp)) {
@@ -362,7 +400,7 @@ public class Main {
                     java.nio.file.StandardCopyOption.REPLACE_EXISTING,
                     java.nio.file.StandardCopyOption.ATOMIC_MOVE);
         } catch (Exception e) {
-            System.err.println("[WARN] Could not persist ui.themeMode: " + e);
+            System.err.println("[WARN] Could not persist " + key + ": " + e);
         }
     }
 
