@@ -181,6 +181,18 @@ public class Main {
                     cfg.cotDebugIcaoRegex == null ? "all" : cfg.cotDebugIcaoRegex);
         }
 
+        // Build the receiver up-front so both the shutdown hook AND the
+        // MainFrame can see it. In UI mode the receiver runs on its own
+        // daemon thread so the EDT stays free (and Reconnect button can
+        // relaunch it later without blocking anything).
+        AdsbReceiver receiverForUi = null;
+        if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
+            receiverForUi = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
+                    cfg.verbose, cfg.rtlPath,
+                    stateStore, liveBuilder.get(), sinks);
+        }
+        final AdsbReceiver uiReceiverRef = receiverForUi;   // effectively-final for the lambda
+
         // Optional UI. Opens on the EDT so the receiver doesn't block on it.
         if (cfg.ui) {
             if (GraphicsEnvironment.isHeadless()) {
@@ -192,7 +204,8 @@ public class Main {
                             cfg.cotAffiliation, cfg.cotCategory,
                             cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds,
                             initialTheme,
-                            newTheme -> writeThemeMode(storePath, newTheme));
+                            newTheme -> writeThemeMode(storePath, newTheme),
+                            uiReceiverRef);
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -212,20 +225,21 @@ public class Main {
             System.out.println("[INFO] Add --udp / --multicast / --tcp-port sinks or use --ui.");
         }
 
-        // Shutdown hook closes every attached sink.
-        // Build the receiver up-front so the shutdown hook can see it
-        // and politely stop the rtl_adsb subprocess. Order matters:
-        // the child MUST be terminated before the JVM exits, otherwise
-        // libusb-1.0 on Windows leaks the USB endpoint and the next
-        // launch fails with 'usb_open error -3' (issue #13).
-        AdsbReceiver receiver = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
-                cfg.verbose, cfg.rtlPath,
-                stateStore, liveBuilder.get(), sinks);
+        // Shutdown hook closes every attached sink. Order matters:
+        // the rtl_adsb child MUST be terminated before the JVM exits,
+        // otherwise libusb-1.0 on Windows leaks the USB endpoint and
+        // the next launch fails with 'usb_open error -3' (issue #13).
+        final AdsbReceiver receiver;
+        if (uiReceiverRef != null) {
+            receiver = uiReceiverRef;      // reuse the one MainFrame already has
+        } else {
+            receiver = new AdsbReceiver(cfg.deviceIndex, cfg.gain, cfg.format,
+                    cfg.verbose, cfg.rtlPath,
+                    stateStore, liveBuilder.get(), sinks);
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("[INFO] Shutting down\u2026");
-            // Stop the subprocess FIRST so it can release the USB
-            // endpoint before we close sockets.
             try { receiver.stop(); }
             catch (Exception e) {
                 System.err.println("[WARN] Error stopping rtl_adsb: " + e);
@@ -233,8 +247,23 @@ public class Main {
             sinks.closeAll();
         }, "adsb-shutdown"));
 
-        // Start receiver -- blocks on the rtl_adsb stdout stream.
-        receiver.start();
+        if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
+            // UI mode: run the receiver on a daemon thread so the EDT
+            // (and the Reconnect button) stays responsive. Thread
+            // exits when start() returns; Reconnect spawns a fresh one.
+            Thread t = new Thread(() -> {
+                try { receiver.start(); }
+                catch (Exception e) {
+                    System.err.println("[ERROR] Receiver thread died: " + e);
+                    e.printStackTrace();
+                }
+            }, "adsb-receiver");
+            t.setDaemon(true);   // JVM stays up because Swing EDT is non-daemon
+            t.start();
+        } else {
+            // CLI mode: blocking start() on the main thread as before.
+            receiver.start();
+        }
     }
 
     /**

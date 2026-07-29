@@ -75,6 +75,59 @@ public class AdsbReceiver {
     private volatile boolean stopping;
 
     /**
+     * Optional listener fired every time the running/stopped state
+     * transitions. Fires on the caller thread (usually the receiver
+     * background thread on start/exit; the caller thread on stop()).
+     * The UI installs this to enable/disable the Reconnect button and
+     * update the status label without polling. Nullable.
+     */
+    private volatile Runnable stateChangedListener;
+
+    /** Install a state-transition listener; pass null to clear. Idempotent. */
+    public void setStateChangedListener(Runnable listener) {
+        this.stateChangedListener = listener;
+    }
+
+    /** Fire the state-changed listener; swallow any exception so listener bugs can't kill the receiver. */
+    private void fireStateChanged() {
+        Runnable l = stateChangedListener;
+        if (l == null) return;
+        try { l.run(); } catch (Exception e) {
+            System.err.println("[WARN] AdsbReceiver state listener threw: " + e);
+        }
+    }
+
+    /**
+     * @return true when the rtl_adsb subprocess is currently spawned
+     *         and reporting alive. False before {@link #start()} has
+     *         been called, between attempts during the launch retry
+     *         loop, and after {@link #stop()} or a terminal launch
+     *         failure.
+     */
+    public boolean isRunning() {
+        Process p = this.rtlProc;
+        return p != null && p.isAlive();
+    }
+
+    /**
+     * Clear the {@link #stopping} flag so a subsequent {@link #start()}
+     * call can run its launch-retry loop again. Called by the UI's
+     * Reconnect button (Marty 2026-07-29 11:28 UTC): the operator
+     * launched with no dongle attached, all 4 attempts failed, receiver
+     * returned; now they've plugged the dongle in and want another try
+     * without restarting the JVM.
+     *
+     * <p>Safe to call while a receiver is running (no-op then). Do NOT
+     * call while a launch retry loop is mid-flight -- results are
+     * undefined. UI callers should gate the reconnect button on
+     * {@link #isRunning()} being false AND the internal reconnect-in-
+     * progress flag being false; see MainFrame for the coordination.
+     */
+    public void resetForRestart() {
+        this.stopping = false;
+    }
+
+    /**
      * @param stateStore may be null when the receiver is only serving
      *                   stateless AVR/JSON sinks
      * @param cotBuilder may be null when no CoT sink is envisaged; only
@@ -156,24 +209,32 @@ public class AdsbReceiver {
      * {@value #MAX_USB_LAUNCH_ATTEMPTS} attempts, before giving up.
      */
     public void start() throws Exception {
-        for (int attempt = 1; attempt <= MAX_USB_LAUNCH_ATTEMPTS; attempt++) {
-            if (stopping) return;
-            LaunchResult r = launchOnce(attempt);
-            if (r == LaunchResult.STARTED_AND_EXITED_NORMALLY) return;
-            if (r != LaunchResult.USB_LOCKED) return; // some other error; surfaced by launchOnce
-            if (attempt == MAX_USB_LAUNCH_ATTEMPTS) {
-                System.err.println(
-                        "[ERROR] rtl_adsb still reporting 'usb_open error -3' after "
-                        + MAX_USB_LAUNCH_ATTEMPTS + " attempts.\n"
-                      + "        The RTL-SDR dongle's USB endpoint appears locked.\n"
-                      + "        Unplug the dongle and reconnect it, then relaunch.");
-                return;
+        try {
+            for (int attempt = 1; attempt <= MAX_USB_LAUNCH_ATTEMPTS; attempt++) {
+                if (stopping) return;
+                LaunchResult r = launchOnce(attempt);
+                if (r == LaunchResult.STARTED_AND_EXITED_NORMALLY) return;
+                if (r != LaunchResult.USB_LOCKED) return; // some other error; surfaced by launchOnce
+                if (attempt == MAX_USB_LAUNCH_ATTEMPTS) {
+                    System.err.println(
+                            "[ERROR] rtl_adsb still reporting 'usb_open error -3' after "
+                            + MAX_USB_LAUNCH_ATTEMPTS + " attempts.\n"
+                          + "        The RTL-SDR dongle's USB endpoint appears locked.\n"
+                          + "        Unplug the dongle and reconnect it, then relaunch\n"
+                          + "        (or click Reconnect in the UI once the dongle is back).");
+                    return;
+                }
+                System.out.printf("[WARN] rtl_adsb hit usb_open error -3 (attempt %d/%d). "
+                        + "Waiting %ds for the USB endpoint to release, then retrying…%n",
+                        attempt, MAX_USB_LAUNCH_ATTEMPTS, USB_RETRY_DELAY_SECONDS);
+                try { Thread.sleep(USB_RETRY_DELAY_SECONDS * 1000L); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
-            System.out.printf("[WARN] rtl_adsb hit usb_open error -3 (attempt %d/%d). "
-                    + "Waiting %ds for the USB endpoint to release, then retrying…%n",
-                    attempt, MAX_USB_LAUNCH_ATTEMPTS, USB_RETRY_DELAY_SECONDS);
-            try { Thread.sleep(USB_RETRY_DELAY_SECONDS * 1000L); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+        } finally {
+            // Whether we exited via normal-exit, USB-locked-terminal, or
+            // other failure, the running state is now definitively OFF.
+            // Fire the listener so the UI's Reconnect button re-enables.
+            fireStateChanged();
         }
     }
 
@@ -204,6 +265,7 @@ public class AdsbReceiver {
         }
         Process proc = pb.start();
         this.rtlProc = proc;
+        fireStateChanged();  // UI: transition to running
 
         // Watched stderr flag: set when we see the USB-locked marker.
         final java.util.concurrent.atomic.AtomicBoolean sawUsbLock =
@@ -346,6 +408,7 @@ public class AdsbReceiver {
             p.destroyForcibly();
         }
         this.rtlProc = null;
+        fireStateChanged();
     }
 
     private ProcessBuilder buildProcess() throws java.io.FileNotFoundException {

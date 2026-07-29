@@ -1,5 +1,6 @@
 package com.adsb.ui;
 
+import com.adsb.core.AdsbReceiver;
 import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
 import com.adsb.model.AircraftStateStore;
@@ -72,6 +73,10 @@ public final class MainFrame extends JFrame {
      * @param onThemeChanged called every time the operator cycles the
      *                     theme; typical impl writes to the config file.
      *                     Nullable if persistence isn't wired.
+     * @param receiver     live {@link AdsbReceiver} for the Reconnect
+     *                     toolbar button (Marty 2026-07-29 11:28 UTC).
+     *                     Nullable: when null, the Reconnect button is
+     *                     hidden (headless smoke tests / non-UI paths).
      */
     public MainFrame(String version,
                      AircraftStateStore store,
@@ -82,7 +87,8 @@ public final class MainFrame extends JFrame {
                      IcaoAircraftClassifier.Category    initialCat,
                      int initialStaleAir, int initialStaleGround,
                      ThemeMode initialTheme,
-                     Consumer<ThemeMode> onThemeChanged) {
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -142,12 +148,66 @@ public final class MainFrame extends JFrame {
                 "Version + help + links",
                 () -> sideDock.toggle(ID_ABOUT,      "About",      aboutPanel));
 
+        // Reconnect button (Marty 2026-07-29 11:28 UTC): kickstarts the
+        // rtl_adsb subprocess again after a failed startup (dongle wasn't
+        // plugged in, USB endpoint locked from a prior orphaned child,
+        // etc.). Also shows a live status hint so the operator can see
+        // whether the receiver is currently running.
+        toolbar.add(javax.swing.Box.createHorizontalGlue());
+        if (receiver != null) {
+            JLabel rxStatus = new JLabel("rx: " + (receiver.isRunning() ? "running" : "stopped"));
+            rxStatus.setBorder(BorderFactory.createEmptyBorder(0, 6, 0, 6));
+            toolbar.add(rxStatus);
+
+            JButton reconnectBtn = new JButton("Reconnect",
+                    MaterialIcon.of(MaterialIcon.Glyph.SETTINGS, 18));
+            reconnectBtn.setToolTipText(
+                    "Restart the rtl_adsb subprocess (use after plugging the dongle back in)");
+            reconnectBtn.setFocusable(false);
+            reconnectBtn.setHorizontalTextPosition(javax.swing.SwingConstants.RIGHT);
+            reconnectBtn.setIconTextGap(6);
+            java.util.concurrent.atomic.AtomicBoolean reconnectInFlight =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+            Runnable refreshBtn = () -> {
+                boolean running = receiver.isRunning();
+                boolean inflight = reconnectInFlight.get();
+                reconnectBtn.setEnabled(!running && !inflight);
+                rxStatus.setText("rx: " + (running ? "running"
+                                        : inflight ? "reconnecting\u2026"
+                                                   : "stopped"));
+            };
+            reconnectBtn.addActionListener(e -> {
+                if (!reconnectInFlight.compareAndSet(false, true)) return;
+                refreshBtn.run();
+                Thread t = new Thread(() -> {
+                    try {
+                        receiver.resetForRestart();
+                        receiver.start();   // blocks until the retry loop finishes
+                    } catch (Exception ex) {
+                        System.err.println("[ERROR] Reconnect failed: " + ex);
+                        ex.printStackTrace();
+                    } finally {
+                        reconnectInFlight.set(false);
+                        SwingUtilities.invokeLater(refreshBtn);
+                    }
+                }, "adsb-reconnect");
+                t.setDaemon(true);
+                t.start();
+            });
+            toolbar.add(reconnectBtn);
+
+            receiver.setStateChangedListener(() -> SwingUtilities.invokeLater(refreshBtn));
+            Timer rxPoll = new Timer(2000, e -> refreshBtn.run());
+            rxPoll.setRepeats(true);
+            rxPoll.start();
+            refreshBtn.run();
+        }
+
         // Theme cycle button, right side. Two-state (LIGHT <-> DARK)
         // matching Marty's 2026-07-27 14:28 UTC ask. Label reflects
         // the CURRENT theme so the button reads as "you are here";
         // clicking flips and updates.
         final ThemeMode[] currentTheme = { initialTheme == null ? ThemeMode.LIGHT : initialTheme };
-        toolbar.add(javax.swing.Box.createHorizontalGlue());
         JButton themeBtn = new JButton(themeButtonLabel(currentTheme[0]));
         themeBtn.setToolTipText("Cycle theme: LIGHT <-> DARK");
         themeBtn.setFocusable(false);
