@@ -2,6 +2,7 @@ package com.adsb.cli;
 
 import com.adsb.core.AdsbDecoder;
 import com.adsb.core.AdsbReceiver;
+import com.adsb.core.FilterMode;
 import com.adsb.core.PayloadFormat;
 import com.adsb.core.SinkRegistry;
 import com.adsb.cot.CoTBuilder;
@@ -70,21 +71,22 @@ public class Main {
                 new CoTBuilder(initialClassifier,
                         cfg.cotStaleAirSeconds, cfg.cotStaleGroundSeconds));
 
-        // Configure the position-filter geofence in the shared
-        // OpenSkyFrameAdapter singleton. Explicit --rx-latlon takes
-        // effect from frame #1; without it, the adapter statistically
-        // bootstraps a fence from the first ~20 accepted fixes.
+        // Configure the position filter (Marty 2026-07-29 08:53 UTC).
+        AdsbDecoder.configureFilterMode(cfg.filterMode);
         AdsbDecoder.configureGeofence(cfg.rxLat, cfg.rxLon, cfg.maxRangeNm);
-        if (cfg.rxLat != null && cfg.rxLon != null) {
-            System.out.printf(
-                    "[INFO] Position geofence: explicit receiver %.5f,%.5f, envelope %.0f nm%n",
-                    cfg.rxLat, cfg.rxLon,
-                    cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
-        } else {
-            System.out.printf(
-                    "[INFO] Position geofence: statistical bootstrap (arms after ~%d fixes, envelope %.0f nm)%n",
-                    com.adsb.core.OpenSkyFrameAdapter.BOOTSTRAP_SAMPLES,
-                    cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
+        System.out.printf("[INFO] Position filter mode: %s%n", cfg.filterMode.canonical());
+        if (cfg.filterMode == FilterMode.GEOFENCE || cfg.filterMode == FilterMode.BOTH) {
+            if (cfg.rxLat != null && cfg.rxLon != null) {
+                System.out.printf(
+                        "[INFO]   geofence: explicit receiver %.5f,%.5f, envelope %.0f nm%n",
+                        cfg.rxLat, cfg.rxLon,
+                        cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
+            } else {
+                System.out.printf(
+                        "[INFO]   geofence: statistical bootstrap (arms after ~%d fixes, envelope %.0f nm)%n",
+                        com.adsb.core.OpenSkyFrameAdapter.BOOTSTRAP_SAMPLES,
+                        cfg.maxRangeNm > 0 ? cfg.maxRangeNm : com.adsb.core.OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM);
+            }
         }
 
         // Connector store lives in ~/.adsb-rcvr/adsb-rcvr.properties.
@@ -94,6 +96,15 @@ public class Main {
         try { connectorStore.load(); }
         catch (Exception e) {
             System.err.println("[WARN] Failed to load " + storePath + ": " + e);
+        }
+
+        // Filter mode lives in the same properties file under
+        // filter.mode. CLI flag wins if given, else the persisted value,
+        // else KINEMATIC (Marty 2026-07-29 08:53 UTC default).
+        if (!cfg.filterModeExplicit) {
+            cfg.filterMode = readFilterMode(storePath);
+        } else {
+            writeFilterMode(storePath, cfg.filterMode);
         }
 
         // Theme lives in the same properties file under ui.themeMode.
@@ -216,6 +227,54 @@ public class Main {
      * connector.* entries {@link ConnectorStore} owns) by
      * load-mutate-store rather than overwriting.
      */
+    /**
+     * Read {@code filter.mode} from the shared properties file if it
+     * exists; return {@link FilterMode#KINEMATIC} if the file is missing,
+     * unreadable, or the key isn't set. Shares the file with connectors
+     * + theme + geofence.
+     */
+    private static FilterMode readFilterMode(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return FilterMode.KINEMATIC;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            return FilterMode.fromString(p.getProperty("filter.mode"));
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read filter.mode from "
+                    + storePath + ": " + e);
+            return FilterMode.KINEMATIC;
+        }
+    }
+
+    /**
+     * Persist {@code filter.mode = <canonical>} into the shared properties
+     * file. Load-mutate-store so other keys are preserved.
+     */
+    private static void writeFilterMode(Path storePath, FilterMode mode) {
+        try {
+            java.nio.file.Files.createDirectories(storePath.getParent());
+            java.util.Properties p = new java.util.Properties();
+            if (java.nio.file.Files.exists(storePath)) {
+                try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                    p.load(in);
+                }
+            }
+            p.setProperty("filter.mode", mode.canonical());
+            java.nio.file.Path tmp = storePath.resolveSibling(
+                    storePath.getFileName().toString() + ".tmp");
+            try (var out = java.nio.file.Files.newBufferedWriter(tmp)) {
+                p.store(out, "ADS-B receiver settings");
+            }
+            java.nio.file.Files.move(tmp, storePath,
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not persist filter.mode: " + e);
+        }
+    }
+
     private static void writeThemeMode(Path storePath, ThemeMode mode) {
         try {
             java.nio.file.Files.createDirectories(storePath.getParent());
@@ -315,6 +374,10 @@ public class Main {
                 case "--max-range-nm":
                     cfg.maxRangeNm = Double.parseDouble(args[++i]);
                     break;
+                case "--filter-mode":
+                    cfg.filterMode = FilterMode.fromString(args[++i]);
+                    cfg.filterModeExplicit = true;
+                    break;
                 case "-h": case "--help":
                     printUsage();
                     System.exit(0);
@@ -373,15 +436,27 @@ public class Main {
               --cot-stale-air <seconds>   Airborne stale offset (default 30)
               --cot-stale-ground <seconds>  Ground stale offset (default 120)
 
-            Anti-jump position filter (optional):
+            Anti-jump position filter:
+              --filter-mode <kinematic|geofence|both|off>
+                                          Position-plausibility gate. Default
+                                          KINEMATIC (per-track physics budget:
+                                          last-known speed * 3 + 200 kt headroom,
+                                          hard-capped at 2500 kts, OpenSky jitter
+                                          bypass). GEOFENCE uses a receiver-
+                                          relative box (needs --rx-latlon for
+                                          explicit, else statistical bootstrap).
+                                          BOTH = kinematic AND geofence. OFF = no
+                                          plausibility filter (debug only).
+                                          Persisted to adsb-rcvr.properties.
+
               --rx-latlon <LAT,LON>       Receiver position for the geofence, e.g.
-                                          50.04277,8.32778. NOT required for CPR
-                                          decoding; when omitted, the adapter
-                                          statistically bootstraps a geofence
-                                          from the first ~20 accepted fixes.
+                                          50.04277,8.32778. Only used in
+                                          filter-mode geofence or both. Omitted:
+                                          statistical bootstrap arms after ~20
+                                          fixes.
               --max-range-nm <N>          Geofence outer envelope in nm
-                                          (default 350). Applies in both explicit
-                                          and bootstrap modes.
+                                          (default 350). Only used in
+                                          filter-mode geofence or both.
 
             RTL-SDR options:
               --rtl-device <index>        Device index (default: 0)
@@ -431,6 +506,10 @@ public class Main {
         Double rxLon = null;
         /** Geofence outer envelope, nm. 0 -> use OpenSkyFrameAdapter.DEFAULT_MAX_RANGE_NM. */
         double maxRangeNm = 0.0;
+        /** Which position-plausibility filter to run. Default resolves from properties file. */
+        FilterMode filterMode = FilterMode.KINEMATIC;
+        /** True when --filter-mode was passed on the CLI (persist it, override any saved value). */
+        boolean filterModeExplicit = false;
 
         boolean hasAnyForwarder() {
             return udpHost != null || multicastGroup != null || tcpPort > 0;

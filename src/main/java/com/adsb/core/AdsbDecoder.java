@@ -82,6 +82,15 @@ public class AdsbDecoder {
         typedAdapter().configureGeofence(rxLat, rxLon, maxRangeNm);
     }
 
+    /**
+     * Set the shared adapter's position-plausibility filter mode. See
+     * {@link FilterMode} for semantics. Safe to call at any time; takes
+     * effect on the next frame.
+     */
+    public static void configureFilterMode(FilterMode mode) {
+        typedAdapter().setFilterMode(mode);
+    }
+
     /** Trim leading * and trailing ; and parse hex; returns null on any parse failure. */
     private static byte[] parseAvr(String avrLine) {
         if (avrLine == null) return null;

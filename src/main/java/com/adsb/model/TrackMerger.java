@@ -35,6 +35,22 @@ public final class TrackMerger {
             if (f.isGeometric()) b.altGeomFt(f.altitudeFt());
             else                 b.altBaroFt(f.altitudeFt());
             b.onGround(false);
+
+            // Derived-velocity fallback (Marty 2026-07-29 08:53 UTC):
+            // when the aircraft has never emitted a TC 19 velocity frame,
+            // the adapter estimates ground speed + heading from the last
+            // two accepted positions and attaches them to the position
+            // frame. We promote those into the track ONLY when the reported
+            // fields are still NaN -- a real TC 19 frame will overwrite the
+            // derived value on next merge, and a subsequent position frame
+            // (which the adapter will NOT decorate once reported velocity
+            // has been seen) won't overwrite reported speed with derived.
+            if (!Double.isNaN(f.derivedGroundSpeedKts()) && Double.isNaN(b.currentGroundSpeedKts())) {
+                b.groundSpeedKts(f.derivedGroundSpeedKts());
+            }
+            if (!Double.isNaN(f.derivedTrackDeg()) && Double.isNaN(b.currentTrackDeg())) {
+                b.trackDeg(f.derivedTrackDeg());
+            }
         } else if (frame instanceof AdsbFrame.AirborneVelocity f) {
             b.groundSpeedKts(f.groundSpeedKts())
              .trackDeg(f.trackDeg())

@@ -135,6 +135,17 @@ public record AdsbTrack(
             this.icaoHex = icaoHex.toUpperCase();
         }
 
+        // Read-back accessors (added 2026-07-29): TrackMerger needs to
+        // ask "is the reported groundSpeedKts still absent?" before deciding
+        // whether to promote a derived-velocity fallback into the snapshot.
+        // The builder is populated by AircraftStateStore#update from the
+        // previous snapshot before the frame is applied, so these accessors
+        // read either the previous-snapshot value or a value set earlier
+        // during this same merge -- both are correct signals of "already
+        // known".
+        public double  currentGroundSpeedKts() { return groundSpeedKts; }
+        public double  currentTrackDeg()       { return trackDeg; }
+
         public Builder callsign(String v)         { this.callsign = v;         return this; }
         public Builder emitterCategory(String v)  { this.emitterCategory = v;  return this; }
         public Builder squawk(String v)           { this.squawk = v;           return this; }

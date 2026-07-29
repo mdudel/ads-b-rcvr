@@ -95,6 +95,40 @@ class TrackMergerTest {
     }
 
     @Test
+    void derived_velocity_on_position_frame_populates_track_when_no_reported() {
+        // 2026-07-29 CoT enrichment: when the adapter attaches derived
+        // (speed, heading) to an AirbornePosition frame AND no reported
+        // velocity has been merged yet, TrackMerger must promote them
+        // into the track so CoTBuilder emits a non-empty <track> element.
+        AircraftStateStore store = new AircraftStateStore();
+        TrackMerger.merge(store, new AdsbFrame.AirbornePosition(
+                "A1B2C3", 48.0, 11.0, 34800, /*geom*/ false,
+                /*derivedSpd*/ 420.0, /*derivedHdg*/ 87.5));
+        AdsbTrack t = store.get("A1B2C3");
+        assertEquals(420.0, t.groundSpeedKts(),
+                "derived speed must populate when no reported speed exists");
+        assertEquals(87.5, t.trackDeg(),
+                "derived heading must populate when no reported heading exists");
+    }
+
+    @Test
+    void reported_velocity_wins_over_derived_from_later_position_frame() {
+        // Reported (TC 19) arrives first; a subsequent position frame with
+        // a derived-velocity payload must NOT overwrite the reported value.
+        AircraftStateStore store = new AircraftStateStore();
+        TrackMerger.merge(store,
+                new AdsbFrame.AirborneVelocity("A1B2C3", 450.0, 90.0, 0));
+        TrackMerger.merge(store, new AdsbFrame.AirbornePosition(
+                "A1B2C3", 48.0, 11.0, 34800, false,
+                /*derived*/ 999.0, /*derived*/ 180.0));
+        AdsbTrack t = store.get("A1B2C3");
+        assertEquals(450.0, t.groundSpeedKts(),
+                "reported speed must not be overwritten by derived on later position frame");
+        assertEquals(90.0, t.trackDeg(),
+                "reported heading must not be overwritten by derived on later position frame");
+    }
+
+    @Test
     void icao_normalises_to_uppercase() {
         AircraftStateStore store = new AircraftStateStore();
         TrackMerger.merge(store, new AdsbFrame.Identification("a1b2c3", "UAL1", "A3"));

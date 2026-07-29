@@ -195,59 +195,118 @@ class OpenSkyFrameAdapterTest {
     // and keeps each pin focused on ONE rule.
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Kinematic filter (Marty 2026-07-29 08:53 UTC)
+    //
+    // Per-track physics gate: budget = last-known-speed * 3 + 200 kt
+    // (hard-capped at 2500 kt), max_dist = budget * dt / 3600.
+    // Speed source hierarchy: reported (TC 19) > derived (median-5) >
+    // fallback (2500 kt). First fix always accepted; second-fix gate
+    // uses the fallback ceiling.
+    // ------------------------------------------------------------------
+
     @Test
-    void speed_check_accepts_slow_jitter_burst_at_openSky_thresholds() {
-        // Regression pin for the 2026-07-29 false-reject crisis: rtl_adsb
-        // over USB buffers frames in bursts, so two frames the aircraft
-        // transmitted 5s apart on the wire can arrive 0.5s apart in our
-        // readLine loop. A real ~1600 kt implied speed used to be rejected
-        // (1200 kt ceiling); the OpenSky-style jitter bypass
-        // (dt<0.7s AND d<2 km) now unconditionally accepts because the
-        // absolute distance is realistic no matter what the derived speed
-        // says. Frankfurt anchor + a 0.5 nm jump in 0.5 s ~= 3600 kts,
-        // which BOTH the old and new ceilings would reject if not for the
-        // jitter bypass.
+    void kinematic_first_fix_is_accepted_unconditionally() {
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
-        // Disable the geofence so we test the speed rule in isolation.
-        a.configureGeofence(50.04277, 8.32778, 10_000.0);
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
+        assertTrue(a.sanityCheckPosition("CAFE01", 50.0, 8.0, 1000.0),
+                "first-fix policy: no anchor -> accept");
+    }
+
+    @Test
+    void kinematic_second_fix_uses_fallback_ceiling() {
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
+        a.seedLastGoodForTest("AAA001", 0.0, 0.0, 1000.0);
+        // Fallback budget 2500 kts, max_dist over 10s = 2500 * 10/3600 = 6.94 nm.
+        // 100 nm east -> 36000 kts implied -> REJECT (100 >> 6.94).
+        assertFalse(a.sanityCheckPosition("AAA001", 0.0, 100.0 / 60.0, 1010.0),
+                "36000 kt implied jump must reject at fallback budget");
+        // 5 nm east in 10s -> 1800 kts, 5 nm < 6.94 nm max_dist -> accept.
+        assertTrue(a.sanityCheckPosition("AAA001", 0.0, 5.0 / 60.0, 1010.0),
+                "5 nm/10s (1800 kts) must accept at fallback budget (6.94 nm max)");
+    }
+
+    @Test
+    void kinematic_uses_reported_velocity_when_present() {
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
+        // Cessna: 90 kts reported. Budget = min(2500, 90*3+200) = 470 kts.
+        // Over 10 s: max_dist = 470 * 10/3600 = 1.31 nm.
+        a.seedReportedVelocityForTest("CESSNA", 90.0, 45.0, 1000.0);
+        a.seedLastGoodForTest("CESSNA", 0.0, 0.0, 1000.0);
+        assertFalse(a.sanityCheckPosition("CESSNA", 0.0, 5.0 / 60.0, 1010.0),
+                "5 nm/10s must reject when reported speed is 90 kts (max 1.31 nm)");
+        assertTrue(a.sanityCheckPosition("CESSNA", 0.0, 1.0 / 60.0, 1010.0),
+                "1 nm/10s must accept at 470-kt (1.31 nm) budget");
+    }
+
+    @Test
+    void kinematic_records_derived_speed_and_heading_on_accept() {
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
+        a.seedLastGoodForTest("DER001", 0.0, 0.0, 1000.0);
+        // 1 nm east in 10 s -> 360 kts, bearing 90 (due east).
+        assertTrue(a.sanityCheckPosition("DER001", 0.0, 1.0 / 60.0, 1010.0),
+                "1 nm/10s must accept");
+        double[] derived = a.lastDerivedVelocityForTest("DER001");
+        assertNotNull(derived, "accepted transition must populate derived cache");
+        assertEquals(360.0, derived[0], 5.0, "derived speed ~360 kts");
+        assertEquals(90.0, derived[1], 1.0, "derived heading ~90 deg (due east)");
+    }
+
+    @Test
+    void kinematic_no_derived_estimate_after_reported_velocity_seen() {
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
+        a.seedLastGoodForTest("REP001", 0.0, 0.0, 1000.0);
+        assertTrue(a.sanityCheckPosition("REP001", 0.0, 1.0 / 60.0, 1010.0),
+                "first accepted transition seeds derived cache");
+        assertNotNull(a.lastDerivedVelocityForTest("REP001"));
+        // Reported velocity arrives -- adapter should wipe derived.
+        a.seedReportedVelocityForTest("REP001", 450.0, 90.0, 1015.0);
+        assertNull(a.lastDerivedVelocityForTest("REP001"),
+                "derived cache must be cleared when reported velocity is seeded");
+        // Subsequent accepted transition must NOT re-populate derived cache.
+        a.seedLastGoodForTest("REP001", 0.0, 1.0 / 60.0, 1020.0);
+        assertTrue(a.sanityCheckPosition("REP001", 0.0, 2.0 / 60.0, 1030.0),
+                "post-reported transition must accept at reported-based budget");
+        assertNull(a.lastDerivedVelocityForTest("REP001"),
+                "derived cache must stay null once reported velocity is known");
+    }
+
+    @Test
+    void initialBearing_helper_returns_reasonable_values() {
+        assertEquals(90.0, OpenSkyFrameAdapter.initialBearingDeg(0.0, 0.0, 0.0, 1.0), 0.5);
+        assertEquals(0.0, OpenSkyFrameAdapter.initialBearingDeg(0.0, 0.0, 1.0, 0.0), 0.5);
+        assertEquals(180.0, OpenSkyFrameAdapter.initialBearingDeg(0.0, 0.0, -1.0, 0.0), 0.5);
+        assertEquals(270.0, OpenSkyFrameAdapter.initialBearingDeg(0.0, 0.0, 0.0, -1.0), 0.5);
+    }
+
+    @Test
+    void off_mode_accepts_everything_that_openSky_lets_through() {
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.OFF);
+        // 3000 nm wild jump in 10 s -- kinematic and geofence would both reject.
+        a.seedLastGoodForTest("OFF001", 0.0, 0.0, 1000.0);
+        assertTrue(a.sanityCheckPosition("OFF001", 0.0, 60.0, 1010.0),
+                "OFF mode must accept even wild jumps (debug escape hatch)");
+    }
+
+    @Test
+    void jitter_burst_bypass_accepts_even_high_implied_speed() {
+        // rtl_adsb over USB buffers frames in bursts, so two frames the
+        // aircraft transmitted 5s apart on the wire can arrive 0.5s apart.
+        // The OpenSky-style jitter bypass (dt<0.7s AND d<1.08 nm)
+        // unconditionally accepts because the absolute distance is realistic.
+        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.KINEMATIC);
         a.seedLastGoodForTest("3C666C", 50.04277, 8.32778, 1000.0);
-        // 0.5 nm north, 0.5 s later -> ~3600 kts implied.
+        // 0.5 nm north, 0.5 s later -> ~3600 kts implied. Would reject on physics,
+        // must accept via jitter bypass.
         double lat2 = 50.04277 + (0.5 / 60.0);
         assertTrue(a.sanityCheckPosition("3C666C", lat2, 8.32778, 1000.5),
-                "jitter-window burst (dt<0.7s AND d<2km) must be accepted");
-    }
-
-    @Test
-    void speed_check_accepts_up_to_2500_kts_after_ceiling_raise() {
-        // Regression pin for the 2026-07-29 ceiling raise 1200 -> 2500.
-        // OpenSky's own PositionDecoder.withinThreshold uses
-        // 514.4 m/s * 2.5 = 1286 m/s ~= 2500 kts; we now match. Real
-        // 500 kt jets under 2x-3x bursty compression can appear as 1500-
-        // 2000 kts implied, and used to be rejected. This test pins
-        // acceptance at ~2000 kts (well over the old 1200 ceiling, well
-        // under the new 2500 ceiling). Uses dt=10s so the jitter bypass
-        // does NOT apply -- this MUST exercise the speed rule.
-        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
-        a.configureGeofence(0.0, 0.0, 10_000.0);
-        a.seedLastGoodForTest("AAA111", 0.0, 0.0, 1000.0);
-        // 5.5 nm east, 10 s later -> 5.5 nm / (10/3600) h = 1980 kts.
-        double lon2 = 5.5 / 60.0;
-        assertTrue(a.sanityCheckPosition("AAA111", 0.0, lon2, 1010.0),
-                "1980 kts implied (below 2500 kt ceiling) must be accepted");
-    }
-
-    @Test
-    void speed_check_still_rejects_above_2500_kts() {
-        // The ceiling raise didn't turn off the speed check -- real
-        // wild-longitude glitches (85 000 / 296 000 / 212 000 kts in the
-        // 2026-07-29 log) MUST still be rejected.
-        OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
-        a.configureGeofence(0.0, 0.0, 100_000.0);   // ridiculously wide -- test speed rule alone
-        a.seedLastGoodForTest("BBB222", 0.0, 0.0, 1000.0);
-        // 100 nm east, 10s later -> 36 000 kts. Well over 2500.
-        double lon2 = 100.0 / 60.0;
-        assertFalse(a.sanityCheckPosition("BBB222", 0.0, lon2, 1010.0),
-                "36 000 kt implied speed must still be rejected after ceiling raise");
+                "jitter-window burst (dt<0.7s AND d<1.08 nm) must be accepted");
     }
 
     @Test
@@ -256,7 +315,10 @@ class OpenSkyFrameAdapterTest {
         // across the map because a bad FIRST fix (before any anchor exists)
         // slipped through. The geofence closes that hole: with an explicit
         // receiver position it fires from frame #1 regardless of anchor.
+        // NOTE: default filter is now KINEMATIC (2026-07-29 08:53) so
+        // geofence tests must set the mode explicitly.
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.GEOFENCE);
         // Frankfurt receiver, 350 nm envelope (default).
         a.configureGeofence(50.04277, 8.32778, 350.0);
         // 3170 nm away -- exactly the kind of wild jump the 4B/47/3C ICAOs
@@ -278,6 +340,7 @@ class OpenSkyFrameAdapterTest {
         // (b) the post-arm envelope rejects a fix far outside the
         // observed cluster.
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.GEOFENCE);
         a.configureGeofence(null, null, 350.0);   // bootstrap mode
 
         // Feed 20 accepted fixes tightly clustered around Frankfurt.
@@ -314,6 +377,7 @@ class OpenSkyFrameAdapterTest {
         // without a reference we can't fence, so early fixes are gated
         // only by OpenSky's isReasonable() + the speed check).
         OpenSkyFrameAdapter a = new OpenSkyFrameAdapter();
+        a.setFilterMode(com.adsb.core.FilterMode.GEOFENCE);
         a.configureGeofence(null, null, 350.0);
         // No fixes fed yet -> no anchor + no armed fence -> everything passes.
         assertTrue(a.sanityCheckPosition("CAFE02", 50.0, 8.0, 1000.0),

@@ -211,6 +211,56 @@ public final class OpenSkyFrameAdapter {
     /** Last accepted position for one ICAO. Package-private for tests. */
     record LastGoodPosition(double lat, double lon, double timeSec) {}
 
+    // ------------------------------------------------------------------
+    // Kinematic filter state (Marty 2026-07-29 08:53 UTC)
+    //
+    // Per-ICAO speed budget hierarchy:
+    //   1. Most recent AirborneVelocity (TC 19) frame -- reportedVelocities.
+    //   2. Median of last KINEMATIC_HISTORY_SAMPLES accepted-transition
+    //      implied speeds -- impliedSpeedHistory. Only used when no
+    //      reported velocity has EVER arrived for this ICAO
+    //      (sawReportedVelocity).
+    //   3. KINEMATIC_FALLBACK_KTS (2500) when we have neither.
+    //
+    // Budget = min(KINEMATIC_HARD_CAP_KTS,
+    //              speed_source * KINEMATIC_MULTIPLIER + KINEMATIC_HEADROOM_KTS).
+    // Distance ceiling = budget * dt / 3600.
+    // ------------------------------------------------------------------
+
+    static final double KINEMATIC_MULTIPLIER   = 3.0;
+    static final double KINEMATIC_HEADROOM_KTS = 200.0;
+    static final double KINEMATIC_HARD_CAP_KTS = 2500.0;
+    static final double KINEMATIC_FALLBACK_KTS = 2500.0;
+    static final int    KINEMATIC_HISTORY_SAMPLES = 5;
+
+    /** Last reported ground speed + track for one ICAO (from TC 19 velocity frame). */
+    record LastReportedVelocity(double groundSpeedKts, double trackDeg, double timeSec) {}
+
+    private final ConcurrentMap<String, LastReportedVelocity> reportedVelocities =
+            new ConcurrentHashMap<>();
+    /** Set once we've ever seen a TC 19 for this ICAO -- disables derived-speed fallback. */
+    private final java.util.Set<String> sawReportedVelocity =
+            java.util.Collections.newSetFromMap(new ConcurrentHashMap<>());
+    /** Per-ICAO ring buffer of last KINEMATIC_HISTORY_SAMPLES accepted-transition implied kts. */
+    private final ConcurrentMap<String, java.util.Deque<Double>> impliedSpeedHistory =
+            new ConcurrentHashMap<>();
+    /** Per-ICAO derived (speed, heading) computed from the LAST accepted transition. */
+    private final ConcurrentMap<String, double[]> lastDerivedVelocity = new ConcurrentHashMap<>();
+
+    /** Active filter mode. Set at boot via {@link #setFilterMode(FilterMode)}. Default: kinematic. */
+    private volatile FilterMode filterMode = FilterMode.KINEMATIC;
+
+    /**
+     * Override the position-plausibility filter. Safe to call at any time;
+     * takes effect on the next frame. See {@link FilterMode} for semantics.
+     */
+    public void setFilterMode(FilterMode mode) {
+        this.filterMode = (mode == null) ? FilterMode.KINEMATIC : mode;
+    }
+
+    /** Test hook: read the active mode. */
+    FilterMode filterMode() { return filterMode; }
+
     /**
      * Test-only hook: pre-seed the last-good record for an ICAO so a
      * unit test can exercise the speed-check path without having to
@@ -220,6 +270,18 @@ public final class OpenSkyFrameAdapter {
     void seedLastGoodForTest(String icaoHex, double lat, double lon, double timeSec) {
         lastGoodPositions.put(icaoHex.toUpperCase(),
                 new LastGoodPosition(lat, lon, timeSec));
+    }
+
+    /**
+     * Test-only hook: pre-seed a reported velocity for an ICAO. Mirrors the
+     * post-condition of a real TC 19 frame arriving: records the velocity
+     * AND flips the "reported seen" flag AND wipes any stale derived cache.
+     */
+    void seedReportedVelocityForTest(String icaoHex, double speedKts, double headingDeg, double timeSec) {
+        String key = icaoHex.toUpperCase();
+        reportedVelocities.put(key, new LastReportedVelocity(speedKts, headingDeg, timeSec));
+        sawReportedVelocity.add(key);
+        lastDerivedVelocity.remove(key);
     }
 
     /**
@@ -288,6 +350,10 @@ public final class OpenSkyFrameAdapter {
             positionDecoders.remove(key);
             lastGoodPositions.remove(key);
             lastRejectWarnMs.remove(key);
+            reportedVelocities.remove(key);
+            sawReportedVelocity.remove(key);
+            impliedSpeedHistory.remove(key);
+            lastDerivedVelocity.remove(key);
         }
     }
 
@@ -300,7 +366,7 @@ public final class OpenSkyFrameAdapter {
      *         (and keep the previous good position downstream)
      */
     boolean sanityCheckPosition(String icao, double lat, double lon, double timeSec) {
-        // Rule 1: range + NaN check.
+        // Rule 1: range + NaN check -- always active, whatever the mode.
         if (Double.isNaN(lat) || Double.isNaN(lon)
                 || lat < -90.0 || lat > 90.0
                 || lon < -180.0 || lon > 180.0) {
@@ -308,43 +374,163 @@ public final class OpenSkyFrameAdapter {
             return false;
         }
 
-        // Rule 2: receiver-relative geofence -- the catch-all that fires
-        // on the FIRST bad frame regardless of anchor. Runs in one of
-        // two modes; see the field-doc block on maxRangeNm above.
-        if (!withinGeofence(lat, lon)) {
-            double[] c = effectiveGeofenceCentre();
-            double r  = effectiveGeofenceRadiusNm();
-            warnReject(icao, String.format(
-                    "outside %.0f nm geofence (centre %.4f,%.4f; dist %.1f nm)",
-                    r, c[0], c[1], haversineNm(c[0], c[1], lat, lon)));
-            return false;
-        }
+        return switch (filterMode) {
+            case OFF       -> true;
+            case GEOFENCE  -> geofenceGate(icao, lat, lon);
+            case KINEMATIC -> kinematicGate(icao, lat, lon, timeSec);
+            case BOTH      -> kinematicGate(icao, lat, lon, timeSec)
+                            && geofenceGate(icao, lat, lon);
+        };
+    }
 
-        // Rule 3: implied-speed check vs last accepted position.
+    /**
+     * Receiver-relative geofence gate. Delegates to {@link #withinGeofence}
+     * and logs the reject when it fires. Preserved from the 2026-07-29
+     * f9af106 commit; still available as an operator-selectable mode.
+     */
+    private boolean geofenceGate(String icao, double lat, double lon) {
+        if (withinGeofence(lat, lon)) return true;
+        double[] c = effectiveGeofenceCentre();
+        if (c == null) return true;   // bootstrap not yet armed
+        double r  = effectiveGeofenceRadiusNm();
+        warnReject(icao, String.format(
+                "outside %.0f nm geofence (centre %.4f,%.4f; dist %.1f nm)",
+                r, c[0], c[1], haversineNm(c[0], c[1], lat, lon)));
+        return false;
+    }
+
+    /**
+     * Per-track kinematic gate (Marty 2026-07-29 08:53 UTC). The BUDGET
+     * scales with each aircraft's own last-known speed:
+     * <pre>
+     *   base_kts   = reported    (from TC 19) or
+     *                derived     (median of last 5 accepted-transition
+     *                             implied kts, if no TC 19 ever seen) or
+     *                fallback    (KINEMATIC_FALLBACK_KTS)
+     *   budget_kts = min(HARD_CAP, base_kts * MULTIPLIER + HEADROOM_KTS)
+     *   max_nm     = budget_kts * dt / 3600
+     *   accept     iff great_circle(last, new) &lt;= max_nm
+     * </pre>
+     *
+     * <p>First-fix policy: accept unconditionally (no anchor to test
+     * against). The follow-on second fix will be gated at
+     * {@link #KINEMATIC_FALLBACK_KTS} budget, catching consistent
+     * glitches on the second frame.
+     *
+     * <p>OpenSky's jitter bypass runs FIRST -- if dt&lt;0.7s AND
+     * distance&lt;1.08 nm the frame is accepted regardless of implied
+     * speed. Guards against rtl_adsb stdout burst-buffer compression.
+     */
+    private boolean kinematicGate(String icao, double lat, double lon, double timeSec) {
         LastGoodPosition last = lastGoodPositions.get(icao);
-        if (last == null) return true;                    // first fix; nothing to compare
+        if (last == null) return true;                    // first fix -- accept
         double dtSec = timeSec - last.timeSec();
-        if (dtSec <= 0.0) return true;                    // out-of-order or same timestamp
-        if (dtSec > LAST_GOOD_TTL_SECONDS) return true;   // stale last-good; skip check
+        if (dtSec <= 0.0) return true;                    // out-of-order / same-ms
+        if (dtSec > LAST_GOOD_TTL_SECONDS) return true;   // stale; anchor is untrustworthy
 
         double distNm = haversineNm(last.lat(), last.lon(), lat, lon);
 
-        // OpenSky-derived jitter bypass: back-to-back frames of a
-        // near-stationary target shouldn't trip the speed check just
-        // because rtl_adsb's stdout buffer emitted them 0.2s apart.
-        // See JITTER_DT_SECONDS / JITTER_DISTANCE_NM javadoc for why.
-        if (dtSec < JITTER_DT_SECONDS && distNm < JITTER_DISTANCE_NM) {
-            return true;
+        // Jitter bypass -- verbatim from OpenSky PositionDecoder.withinThreshold.
+        if (dtSec < JITTER_DT_SECONDS && distNm < JITTER_DISTANCE_NM) return true;
+
+        // Resolve the speed source.
+        double baseKts;
+        String source;
+        LastReportedVelocity rv = reportedVelocities.get(icao);
+        if (rv != null) {
+            baseKts = rv.groundSpeedKts();
+            source  = "reported";
+        } else {
+            Double med = medianImpliedKts(icao);
+            if (med != null) {
+                baseKts = med;
+                source  = "derived-median-" + KINEMATIC_HISTORY_SAMPLES;
+            } else {
+                baseKts = KINEMATIC_FALLBACK_KTS;
+                source  = "fallback";
+            }
         }
 
-        double impliedKts = distNm / (dtSec / 3600.0);
-        if (impliedKts > MAX_PLAUSIBLE_SPEED_KTS) {
+        double budgetKts = Math.min(KINEMATIC_HARD_CAP_KTS,
+                baseKts * KINEMATIC_MULTIPLIER + KINEMATIC_HEADROOM_KTS);
+        double maxDistNm = budgetKts * (dtSec / 3600.0);
+
+        if (distNm > maxDistNm) {
+            double impliedKts = distNm / (dtSec / 3600.0);
             warnReject(icao, String.format(
-                    "implied speed %.0f kts over %.1fs (%.1f nm) exceeds %.0f kts ceiling",
-                    impliedKts, dtSec, distNm, MAX_PLAUSIBLE_SPEED_KTS));
+                    "kinematic reject %.0f kts implied over %.1fs (%.1f nm) exceeds budget %.0f kts "
+                            + "(source: %s %.0f kts \u00d7 %.1f + %.0f)",
+                    impliedKts, dtSec, distNm, budgetKts,
+                    source, baseKts, KINEMATIC_MULTIPLIER, KINEMATIC_HEADROOM_KTS));
             return false;
         }
+
+        // Accepted -- feed this transition into the derived-speed history
+        // ring buffer (used the NEXT time we need a fallback). Skip when the
+        // aircraft has ever reported velocity (we prefer reported forever
+        // after the first TC 19) or when the transition is jitter-scale.
+        if (!sawReportedVelocity.contains(icao) && dtSec >= JITTER_DT_SECONDS) {
+            double impliedKts = distNm / (dtSec / 3600.0);
+            recordImpliedSpeed(icao, impliedKts);
+            // Also cache the (speed, heading) as the CURRENT derived
+            // estimate for CoT emission. Heading via great-circle initial
+            // bearing from last to new.
+            double headingDeg = initialBearingDeg(last.lat(), last.lon(), lat, lon);
+            lastDerivedVelocity.put(icao, new double[] { impliedKts, headingDeg });
+        }
         return true;
+    }
+
+    /**
+     * Push one accepted-transition implied speed onto the per-ICAO ring buffer.
+     * Bounded at {@link #KINEMATIC_HISTORY_SAMPLES}.
+     */
+    private void recordImpliedSpeed(String icao, double impliedKts) {
+        impliedSpeedHistory.compute(icao, (k, deque) -> {
+            java.util.Deque<Double> d = (deque == null) ? new java.util.ArrayDeque<>() : deque;
+            d.addLast(impliedKts);
+            while (d.size() > KINEMATIC_HISTORY_SAMPLES) d.removeFirst();
+            return d;
+        });
+    }
+
+    /**
+     * @return median of buffered implied speeds for this ICAO, or
+     *         {@code null} when the buffer is empty (never had an accepted
+     *         non-jitter transition).
+     */
+    private Double medianImpliedKts(String icao) {
+        java.util.Deque<Double> d = impliedSpeedHistory.get(icao);
+        if (d == null || d.isEmpty()) return null;
+        java.util.List<Double> sorted;
+        synchronized (d) {
+            sorted = new java.util.ArrayList<>(d);
+        }
+        java.util.Collections.sort(sorted);
+        int n = sorted.size();
+        if ((n & 1) == 1) return sorted.get(n / 2);
+        return (sorted.get(n / 2 - 1) + sorted.get(n / 2)) / 2.0;
+    }
+
+    /**
+     * Great-circle initial bearing (forward azimuth) in degrees 0..360.
+     * Package-private for tests.
+     */
+    static double initialBearingDeg(double lat1, double lon1, double lat2, double lon2) {
+        double phi1 = Math.toRadians(lat1);
+        double phi2 = Math.toRadians(lat2);
+        double dLam = Math.toRadians(lon2 - lon1);
+        double y = Math.sin(dLam) * Math.cos(phi2);
+        double x = Math.cos(phi1) * Math.sin(phi2)
+                 - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLam);
+        double bearing = Math.toDegrees(Math.atan2(y, x));
+        double normalized = (bearing + 360.0) % 360.0;
+        return normalized;
+    }
+
+    /** Test hook: read the most recent derived (speed, heading) for one ICAO, or null. */
+    double[] lastDerivedVelocityForTest(String icaoHex) {
+        return lastDerivedVelocity.get(icaoHex.toUpperCase());
     }
 
     /**
@@ -479,6 +665,36 @@ public final class OpenSkyFrameAdapter {
         if (!sanityCheckPosition(icao, p.getLatitude(), p.getLongitude(), timeSec)) {
             return null;
         }
+        // Compute derived velocity BEFORE we overwrite lastGoodPositions --
+        // we need last-to-current haversine + bearing. kinematicGate already
+        // did this for KINEMATIC/BOTH modes; for GEOFENCE/OFF we do it here
+        // so the CoT enrichment works regardless of filter mode.
+        double[] derivedForFrame = { Double.NaN, Double.NaN };
+        if (filterMode == FilterMode.KINEMATIC || filterMode == FilterMode.BOTH) {
+            double[] d = lastDerivedVelocity.get(icao);
+            if (d != null) { derivedForFrame[0] = d[0]; derivedForFrame[1] = d[1]; }
+        } else {
+            // Independently derive for GEOFENCE/OFF so downstream CoT still
+            // gets the enrichment even when we're not running the kinematic
+            // gate. Uses the SAME hierarchy: skip once reported has been seen.
+            LastGoodPosition prev = lastGoodPositions.get(icao);
+            if (prev != null && !sawReportedVelocity.contains(icao)) {
+                double dt = timeSec - prev.timeSec();
+                if (dt >= JITTER_DT_SECONDS && dt <= LAST_GOOD_TTL_SECONDS) {
+                    double nm = haversineNm(prev.lat(), prev.lon(), p.getLatitude(), p.getLongitude());
+                    double impliedKts = nm / (dt / 3600.0);
+                    double headingDeg = initialBearingDeg(prev.lat(), prev.lon(),
+                            p.getLatitude(), p.getLongitude());
+                    if (impliedKts < KINEMATIC_HARD_CAP_KTS) {
+                        recordImpliedSpeed(icao, impliedKts);
+                        lastDerivedVelocity.put(icao,
+                                new double[] { impliedKts, headingDeg });
+                        derivedForFrame[0] = impliedKts;
+                        derivedForFrame[1] = headingDeg;
+                    }
+                }
+            }
+        }
         lastGoodPositions.put(icao,
                 new LastGoodPosition(p.getLatitude(), p.getLongitude(), timeSec));
         feedBootstrap(p.getLatitude(), p.getLongitude());
@@ -504,8 +720,15 @@ public final class OpenSkyFrameAdapter {
         // GNSS-geometric preference is tracked in issue #6.)
         boolean geometric = false;
 
+        // Only attach derived velocity when NO reported velocity has ever
+        // arrived for this ICAO (TrackMerger will refuse to overwrite reported
+        // with derived anyway, but suppressing here also keeps the frame
+        // record honest).
+        double derivedSpd = sawReportedVelocity.contains(icao) ? Double.NaN : derivedForFrame[0];
+        double derivedHdg = sawReportedVelocity.contains(icao) ? Double.NaN : derivedForFrame[1];
         return new AdsbFrame.AirbornePosition(icao,
-                p.getLatitude(), p.getLongitude(), altFt, geometric);
+                p.getLatitude(), p.getLongitude(), altFt, geometric,
+                derivedSpd, derivedHdg);
     }
 
     private AdsbFrame toSurfacePosition(String icao, SurfacePositionV0Msg spos, double timeSec) {
@@ -516,12 +739,22 @@ public final class OpenSkyFrameAdapter {
         return null;
     }
 
-    private static AdsbFrame toVelocity(String icao, VelocityOverGroundMsg vel) {
+    private AdsbFrame toVelocity(String icao, VelocityOverGroundMsg vel) {
         if (!vel.hasVelocityInfo()) return null;
         Double speed = vel.getVelocity();      // knots
         Double heading = vel.getHeading();     // deg true
         Integer vrate = vel.hasVerticalRateInfo() ? vel.getVerticalRate() : null; // ft/min
         if (speed == null || heading == null) return null;
+
+        // Record reported velocity so the kinematic gate can budget from
+        // it AND so the derived-velocity fallback path knows to stop
+        // attaching estimates on subsequent AirbornePosition frames.
+        double timeSec = System.currentTimeMillis() / 1000.0;
+        reportedVelocities.put(icao, new LastReportedVelocity(speed, heading, timeSec));
+        sawReportedVelocity.add(icao);
+        // Wipe any stale derived estimate; reported is authoritative now.
+        lastDerivedVelocity.remove(icao);
+
         return new AdsbFrame.AirborneVelocity(icao,
                 speed, heading,
                 vrate == null ? Integer.MIN_VALUE : vrate);
