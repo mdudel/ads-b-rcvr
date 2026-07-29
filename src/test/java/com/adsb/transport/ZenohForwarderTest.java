@@ -1,8 +1,12 @@
 package com.adsb.transport;
 
+import com.adsb.core.PayloadFormat;
+import com.adsb.ui.model.Connector;
 import com.adsb.ui.model.ZenohMode;
+import com.adsb.ui.model.ZenohTransport;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -187,5 +191,112 @@ class ZenohForwarderTest {
         byte[] cot = "<event uid=\"ICAO-4CA1FA\"/>".getBytes(StandardCharsets.UTF_8);
         assertEquals("4CA1FA", ZenohForwarder.selectSubKey(cot, null),
                 "null mode should behave as PER_AIRCRAFT -- matches ctor coercion contract");
+    }
+
+    // ------------------------------------------------------------------
+    // Post-2026-07-29-refactor: single-arg Connector ctor validation.
+    // We can't reach a live zenohd from the sandbox, so these tests
+    // only exercise the fail-fast validation that runs BEFORE any
+    // network I/O. Success paths need Marty's Windows smoke test.
+    // ------------------------------------------------------------------
+
+    @Test
+    void connector_ctor_rejects_null_connector() {
+        IOException ex = assertThrows(IOException.class,
+                () -> new ZenohForwarder((Connector) null));
+        assertTrue(ex.getMessage().toLowerCase().contains("connector"),
+                "error message should mention Connector; got: " + ex.getMessage());
+    }
+
+    @Test
+    void connector_ctor_rejects_non_zenoh_connector() {
+        Connector udp = Connector.newInstance("UDP", Connector.Type.UDP_UNICAST,
+                "1.2.3.4:6969", PayloadFormat.COT, true);
+        IOException ex = assertThrows(IOException.class, () -> new ZenohForwarder(udp));
+        assertTrue(ex.getMessage().contains("ZENOH"),
+                "error message should mention ZENOH type; got: " + ex.getMessage());
+    }
+
+    @Test
+    void connector_ctor_rejects_missing_endpoint() {
+        Connector c = Connector.newZenoh("z", ZenohTransport.TCP,
+                "",             // endpoint blank
+                "", "adsb/cot",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                null, null, null, false, true);
+        IOException ex = assertThrows(IOException.class, () -> new ZenohForwarder(c));
+        assertTrue(ex.getMessage().toLowerCase().contains("endpoint"),
+                "error message should mention 'endpoint'; got: " + ex.getMessage());
+    }
+
+    @Test
+    void connector_ctor_rejects_missing_topic() {
+        Connector c = Connector.newZenoh("z", ZenohTransport.TCP,
+                "localhost:7447",
+                "", "",         // topic blank
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                null, null, null, false, true);
+        IOException ex = assertThrows(IOException.class, () -> new ZenohForwarder(c));
+        assertTrue(ex.getMessage().toLowerCase().contains("topic")
+                || ex.getMessage().toLowerCase().contains("keyexpr"),
+                "error message should mention 'topic' or 'keyExpr'; got: " + ex.getMessage());
+    }
+
+    @Test
+    void connector_ctor_rejects_tls_transport_without_cert_material() {
+        // TLS transport MUST have all three: client cert, client key, CA.
+        // Verify each one triggers the specific fail-fast.
+        Connector missingCert = Connector.newZenoh("z", ZenohTransport.TLS,
+                "host:7447", "", "adsb/cot",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                null,                    // client cert missing
+                "/tmp/key.pem", "/tmp/ca.pem",
+                false, true);
+        IOException ex = assertThrows(IOException.class, () -> new ZenohForwarder(missingCert));
+        assertTrue(ex.getMessage().toLowerCase().contains("cert"),
+                "missing cert should be called out; got: " + ex.getMessage());
+
+        Connector missingKey = Connector.newZenoh("z", ZenohTransport.TLS,
+                "host:7447", "", "adsb/cot",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                "/tmp/cert.pem", null, "/tmp/ca.pem",
+                false, true);
+        IOException ex2 = assertThrows(IOException.class, () -> new ZenohForwarder(missingKey));
+        assertTrue(ex2.getMessage().toLowerCase().contains("key"),
+                "missing key should be called out; got: " + ex2.getMessage());
+
+        Connector missingCa = Connector.newZenoh("z", ZenohTransport.TLS,
+                "host:7447", "", "adsb/cot",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                "/tmp/cert.pem", "/tmp/key.pem", null,
+                false, true);
+        IOException ex3 = assertThrows(IOException.class, () -> new ZenohForwarder(missingCa));
+        assertTrue(ex3.getMessage().toLowerCase().contains("ca")
+                || ex3.getMessage().toLowerCase().contains("trust"),
+                "missing CA/truststore should be called out; got: " + ex3.getMessage());
+    }
+
+    @Test
+    void connector_ctor_allows_tcp_transport_without_cert_material() {
+        // TCP transport doesn't need any TLS material -- but we can't
+        // actually construct the forwarder in the sandbox (no zenohd).
+        // Instead, verify the fail-fast validation PASSES: the ctor
+        // would throw ConnectException / ClosedChannelException /
+        // similar at the router-connect step, NOT the pre-flight
+        // 'cert missing' IOException. Since the sandbox has no zenohd
+        // running on port 7447, we expect some network-flavoured
+        // exception -- what we're pinning is: NOT the 'cert required'
+        // message.
+        Connector c = Connector.newZenoh("z", ZenohTransport.TCP,
+                "127.0.0.1:1",        // guaranteed-refused port
+                "", "adsb/cot",
+                PayloadFormat.COT, ZenohMode.PER_AIRCRAFT,
+                null, null, null,       // TCP -- no TLS material needed
+                false, true);
+        Exception ex = assertThrows(Exception.class, () -> new ZenohForwarder(c));
+        String msg = ex.getMessage() == null ? "" : ex.getMessage().toLowerCase();
+        assertFalse(msg.contains("cert required") || msg.contains("key path")
+                        || msg.contains("truststore path"),
+                "TCP transport must NOT require TLS material; got: " + ex.getMessage());
     }
 }

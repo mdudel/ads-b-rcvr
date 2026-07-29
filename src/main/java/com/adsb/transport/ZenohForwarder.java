@@ -1,7 +1,9 @@
 package com.adsb.transport;
 
 import com.adsb.core.FrameForwarder;
+import com.adsb.ui.model.Connector;
 import com.adsb.ui.model.ZenohMode;
+import com.adsb.ui.model.ZenohTransport;
 
 import io.mdudel.zenoh.purejava.PureJavaZenohPublisher;
 
@@ -14,52 +16,58 @@ import java.util.regex.Pattern;
  * Publishes each forwarded frame to a Zenoh router as a PUSH message,
  * on a key derived from the payload contents.
  *
+ * <h2>Configuration (post-2026-07-29-refactor)</h2>
+ *
+ * <p>Constructed from a {@link Connector} record: every Zenoh field
+ * (transport, endpoint, org, keyExpr, TLS material, verify-host,
+ * key-layout mode) lives on the Connector so persistence and UI
+ * editing are trivially first-class. The forwarder just reads those
+ * fields at attach time and wires them to the pure-Java facade's
+ * Builder.
+ *
  * <h2>Key expression layout</h2>
  *
- * <p>Controlled by the {@link ZenohMode} passed at construction:
+ * <p>Controlled by {@link Connector#zenohMode()}:
  *
  * <ul>
  *   <li>{@link ZenohMode#STREAM}: every frame publishes to the base
- *       {@code keyPrefix} as-is. All payloads (CoT, JSON, AVR) land on
- *       one topic. Best for downstream consumers that want the whole
- *       feed as a single stream and will dispatch / filter themselves.</li>
+ *       {@code keyExpr} (prepended by {@code org}, if any). All payloads
+ *       (CoT, JSON, AVR) land on one topic. Best for downstream consumers
+ *       that want the whole feed as a single stream and will dispatch /
+ *       filter themselves.</li>
  *   <li>{@link ZenohMode#PER_AIRCRAFT}: CoT XML with a
  *       {@code uid="ICAO-XXXXXX"} attribute publishes to
- *       {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;} so Zenoh subscribers can
- *       select a single aircraft with {@code adsb/cot/4CA1FA} or the
- *       whole fleet with {@code adsb/cot/**}. Non-CoT payloads (AVR /
- *       JSON / bytes without a recognisable {@code uid}) still land on
- *       the base key because there's no reliable per-entity key to
- *       derive.</li>
+ *       {@code &lt;org&gt;/&lt;keyExpr&gt;/&lt;ICAO&gt;} so Zenoh
+ *       subscribers can select a single aircraft with e.g.
+ *       {@code goatnet/tracks/adsb/4CA1FA} or the whole fleet with
+ *       {@code goatnet/tracks/adsb/**}. Non-CoT payloads (AVR / JSON /
+ *       bytes without a recognisable {@code uid}) still land on the
+ *       base key.</li>
  * </ul>
  *
- * <p>The per-aircraft split for CoT is idiomatic Zenoh — one topic per
- * addressable thing — and matches the pattern established by the reference
- * MQTT/CoT bridges (adsbcot, Flinterpop/ADSBtoCOT). It costs nothing at the
- * publisher side (single {@code IndexOf}/regex per frame) and enables cheap
- * subscriber-side filtering by tail-key. But it's not always what an
- * operator wants — hence the mode toggle exposed on every Zenoh connector.
+ * <p>The {@code org} prefix is applied inside
+ * {@link PureJavaZenohPublisher} via
+ * {@link io.mdudel.zenoh.purejava.wire.KeyExpr#resolveKey(String, String)}
+ * with slash normalisation -- callers do not have to pre-join it into
+ * the keyExpr. Blank/null org means no prefix.
  *
- * <h2>Endpoint</h2>
- * <p>Passed straight through to
- * {@link PureJavaZenohPublisher.Builder#connectEndpoint(String)}. Any
- * scheme the pure-Java facade supports works — {@code tcp/host:port},
- * {@code tls/host:port}, {@code ws/host:port}, {@code wss/host:port}.
- * TLS material (client cert / key / CA) is out of scope for this first
- * cut; use plain TCP or unauthenticated WS to a local {@code zenohd} for
- * the first smoke test. If Marty needs mTLS to a hardened router, add a
- * {@code tls-} prefix on the connector target and thread through to
- * the facade's {@code rootCaCertPath()} / {@code clientCertPath()} /
- * {@code clientKeyPath()} setters — filed as a follow-up.
+ * <h2>Transport</h2>
+ * <p>{@link Connector#zenohTransport()} owns the URI scheme (tcp / tls /
+ * ws / wss) which is prepended to {@link Connector#zenohEndpoint()} at
+ * connect time. TLS material ({@code zenohClientCertPath} /
+ * {@code zenohClientKeyPath} / {@code zenohRootCaPath}) is passed to the
+ * Builder only when the transport is TLS-flavoured -- the pure-Java
+ * facade ignores the setters for TCP/WS.
  *
  * <h2>Lifecycle</h2>
  * <p>Constructor blocks on the full Zenoh handshake (InitSyn/Ack,
  * OpenSyn/Ack) so a failed router connection surfaces immediately at
  * attach time (matches how {@link UdpForwarder} etc. surface bind
- * failures). Not lazy on purpose: the {@link com.adsb.ui.model.ConnectorAttacher}
- * failure policy is "throw at attach, leave the connector disabled" —
- * lazy connect would defer the failure to first frame arrival, which
- * happens on a background thread and is easy to miss.
+ * failures). Not lazy on purpose: the
+ * {@link com.adsb.ui.model.ConnectorAttacher} failure policy is
+ * "throw at attach, leave the connector disabled" -- lazy connect
+ * would defer the failure to first frame arrival, which happens on a
+ * background thread and is easy to miss.
  *
  * <h2>Thread safety</h2>
  * <p>{@link PureJavaZenohPublisher#publish(String, byte[])} is safe to
@@ -86,46 +94,82 @@ public final class ZenohForwarder implements FrameForwarder {
             Pattern.compile("uid=\"ICAO-([0-9A-Fa-f]{6})\"");
 
     private final PureJavaZenohPublisher publisher;
-    private final String keyPrefix;
+    private final String keyExpr;
     private final ZenohMode mode;
     private volatile boolean closed = false;
 
     /**
-     * Open a session against {@code endpoint} and prepare to publish
-     * under {@code keyPrefix}. Blocks until the router handshake completes.
+     * Post-refactor primary constructor: read every Zenoh field off the
+     * {@link Connector} and wire it to the pure-Java facade Builder.
      *
-     * @param endpoint   Zenoh connect endpoint, e.g. {@code tcp/localhost:7447}.
-     * @param keyPrefix  Base key expression, e.g. {@code adsb/cot}. Leading
-     *                   and trailing slashes are trimmed to keep the emitted
-     *                   keys well-formed regardless of operator input.
-     * @throws IOException if the endpoint is malformed, the router is
+     * @throws IOException if required fields are missing, the router is
      *                     unreachable, or the Zenoh handshake fails.
      */
-    public ZenohForwarder(String endpoint, String keyPrefix, ZenohMode mode) throws IOException {
+    public ZenohForwarder(Connector c) throws IOException {
+        if (c == null) throw new IOException("Connector is required");
+        if (c.type() != Connector.Type.ZENOH)
+            throw new IOException("ZenohForwarder needs a ZENOH connector, got " + c.type());
+
+        ZenohTransport transport = c.zenohTransport();
+        if (transport == null) transport = ZenohTransport.TCP;
+
+        String endpoint = c.zenohEndpoint();
         if (endpoint == null || endpoint.isBlank())
-            throw new IOException("Zenoh endpoint is required");
-        if (keyPrefix == null || keyPrefix.isBlank())
-            throw new IOException("Zenoh key prefix is required");
-        this.keyPrefix = trimSlashes(keyPrefix);
-        this.mode = (mode == null) ? ZenohMode.PER_AIRCRAFT : mode;
-        // Bind the base key at build time; per-frame sub-keys are appended
-        // via publish(subKey, bytes). The facade concatenates
-        // effectiveKeyExpr + "/" + subKey internally.
-        this.publisher = PureJavaZenohPublisher.builder()
-                .connectEndpoint(endpoint)
-                .keyExpr(this.keyPrefix)
-                .build();
+            throw new IOException("Zenoh endpoint (host:port) is required");
+
+        String keyExpr = c.zenohKeyExpr();
+        if (keyExpr == null || keyExpr.isBlank())
+            throw new IOException("Zenoh topic (keyExpr) is required");
+
+        if (transport.isTls()) {
+            requireNonBlank(c.zenohClientCertPath(), "Zenoh client cert path");
+            requireNonBlank(c.zenohClientKeyPath(),  "Zenoh client key path");
+            requireNonBlank(c.zenohRootCaPath(),     "Zenoh CA / truststore path");
+        }
+
+        this.keyExpr = trimSlashes(keyExpr);
+        this.mode = (c.zenohMode() == null) ? ZenohMode.PER_AIRCRAFT : c.zenohMode();
+
+        PureJavaZenohPublisher.Builder b = PureJavaZenohPublisher.builder()
+                .connectEndpoint(transport.buildEndpoint(endpoint))
+                .keyExpr(this.keyExpr)
+                .org(c.zenohOrg())                  // null/blank -> no prefix (see KeyExpr.resolveKey)
+                .verifyHostname(c.zenohVerifyHostname());
+        if (transport.isTls()) {
+            b.rootCaCertPath(c.zenohRootCaPath())
+             .clientCertPath(c.zenohClientCertPath())
+             .clientKeyPath (c.zenohClientKeyPath());
+        }
+        this.publisher = b.build();
         this.publisher.start();
     }
 
     /**
-     * Convenience overload defaulting to {@link ZenohMode#PER_AIRCRAFT} —
-     * matches the pre-mode shipping behaviour (commit {@code 8e4aca2}).
-     * Preserved so any downstream caller wired against the 2-arg ctor
-     * before the mode field landed keeps compiling. Intentionally does
-     * NOT auto-detect stream vs per-aircraft — the choice is an
-     * operator decision, not a heuristic.
+     * Legacy 3-arg ctor kept for external callers. Constructs a synthetic
+     * ZENOH {@link Connector} from the (endpoint;keyPrefix, mode) triple
+     * so the new primary ctor does all the actual work. Deprecated
+     * because the rich-form Connector fields are strictly more expressive
+     * (org prefix, TLS material, transport dropdown) and this shape can't
+     * represent them.
+     *
+     * <p>Endpoint is passed through verbatim; it must include the URI
+     * scheme (e.g. {@code tcp/localhost:7447}). Split on the first '/'
+     * into scheme + host:port so we can populate the new
+     * {@link ZenohTransport} field.
+     *
+     * @deprecated use {@link #ZenohForwarder(Connector)} instead
      */
+    @Deprecated
+    public ZenohForwarder(String endpoint, String keyPrefix, ZenohMode mode) throws IOException {
+        this(fromLegacy(endpoint, keyPrefix, mode));
+    }
+
+    /**
+     * Convenience overload defaulting to {@link ZenohMode#PER_AIRCRAFT}.
+     *
+     * @deprecated use {@link #ZenohForwarder(Connector)} instead
+     */
+    @Deprecated
     public ZenohForwarder(String endpoint, String keyPrefix) throws IOException {
         this(endpoint, keyPrefix, ZenohMode.PER_AIRCRAFT);
     }
@@ -134,17 +178,11 @@ public final class ZenohForwarder implements FrameForwarder {
      * Publish one frame. Sub-key selection follows the {@link ZenohMode}
      * chosen at construction:
      * <ul>
-     *   <li>{@link ZenohMode#STREAM}: always publishes to the base
-     *       {@code keyPrefix}, regardless of payload contents.</li>
+     *   <li>{@link ZenohMode#STREAM}: always publishes to the base key.</li>
      *   <li>{@link ZenohMode#PER_AIRCRAFT}: CoT XML with a
      *       {@code uid="ICAO-XXXXXX"} attribute publishes to
-     *       {@code &lt;keyPrefix&gt;/&lt;ICAO&gt;}; anything else publishes
-     *       to the base {@code keyPrefix}.</li>
+     *       {@code <base>/<ICAO>}; anything else publishes to the base.</li>
      * </ul>
-     *
-     * <p>Payload bytes are published verbatim; no re-encoding. Zenoh
-     * consumers see exactly the CoT XML / AVR line / JSON blob the
-     * receiver produced.
      */
     @Override
     public void forward(byte[] frame) throws Exception {
@@ -156,23 +194,7 @@ public final class ZenohForwarder implements FrameForwarder {
 
     /**
      * Compute the Zenoh sub-key for one frame under the given mode.
-     * Pulled out of {@link #forward(byte[])} so tests can pin the
-     * decision table hermetically (a live Zenoh router isn't available
-     * in the sandbox but the sub-key choice is pure data).
-     *
-     * <ul>
-     *   <li>{@link ZenohMode#STREAM}: always {@code null} (publish to
-     *       the base key).</li>
-     *   <li>{@link ZenohMode#PER_AIRCRAFT} or {@code null}: delegate to
-     *       {@link #extractIcaoHex} and let it decide (returns ICAO for
-     *       CoT, {@code null} for anything else).</li>
-     * </ul>
-     *
-     * <p>A {@code null} mode is treated as PER_AIRCRAFT to match the
-     * ctor coercion contract; the ctor itself already normalises before
-     * any {@link #forward} call, so production never actually exercises
-     * the null branch, but the invariant is pinned in tests so nobody
-     * accidentally makes this method NPE later.
+     * Package-private for tests.
      */
     static String selectSubKey(byte[] frame, ZenohMode mode) {
         if (mode == ZenohMode.STREAM) return null;
@@ -181,13 +203,8 @@ public final class ZenohForwarder implements FrameForwarder {
 
     /**
      * Extract the ICAO24 hex from a CoT XML payload's {@code uid} attribute,
-     * or {@code null} if the payload doesn't look like CoT.
-     *
-     * <p>Bounded search: we only scan the first 256 bytes to keep this fast
-     * even for chatty payloads. {@link com.adsb.cot.CoTBuilder} emits the
-     * {@code uid} inside the {@code <event ...>} root element, which is
-     * always in the first ~200 bytes of every message. Package-private for
-     * tests.
+     * or {@code null} if the payload doesn't look like CoT. Package-private
+     * for tests.
      */
     static String extractIcaoHex(byte[] frame) {
         int scanLen = Math.min(frame.length, 256);
@@ -197,11 +214,6 @@ public final class ZenohForwarder implements FrameForwarder {
         return m.group(1).toUpperCase();
     }
 
-    /**
-     * Idempotent close. Best-effort — a router that already dropped the
-     * session shouldn't wedge JVM shutdown. Logs any close-time exception
-     * to stderr in the same style as {@link SinkRegistry#remove(String)}.
-     */
     @Override
     public void close() {
         if (closed) return;
@@ -213,9 +225,18 @@ public final class ZenohForwarder implements FrameForwarder {
         }
     }
 
-    /** @return the trimmed key prefix this sink publishes under. Test hook. */
+    /** @return the trimmed key expression this sink publishes under. Test hook. */
+    String keyExpr() {
+        return keyExpr;
+    }
+
+    /**
+     * Retained pre-refactor accessor name so any existing tests / debug
+     * code calling {@code keyPrefix()} keep compiling. New code should
+     * prefer {@link #keyExpr()}.
+     */
     String keyPrefix() {
-        return keyPrefix;
+        return keyExpr;
     }
 
     /** @return the key-layout mode this sink was constructed with. Test hook. */
@@ -223,12 +244,46 @@ public final class ZenohForwarder implements FrameForwarder {
         return mode;
     }
 
+    // -----------------------------------------------------------------
+    // helpers
+    // -----------------------------------------------------------------
+
+    private static void requireNonBlank(String v, String label) throws IOException {
+        if (v == null || v.isBlank()) throw new IOException(label + " is required");
+    }
+
     /**
-     * Strip leading and trailing slashes to keep the emitted key
-     * expression well-formed regardless of whether the operator typed
-     * {@code adsb/cot}, {@code /adsb/cot}, {@code adsb/cot/}, or
-     * {@code /adsb/cot/}. Internal slashes are preserved.
+     * Build a synthetic ZENOH {@link Connector} from the legacy
+     * {@code (schemedEndpoint, keyPrefix, mode)} triple so the deprecated
+     * ctor can delegate. Splits {@code tcp/localhost:7447} into
+     * {@code (ZenohTransport.TCP, "localhost:7447")}. Unknown schemes
+     * fall back to TCP.
      */
+    private static Connector fromLegacy(String schemedEndpoint, String keyPrefix, ZenohMode mode) {
+        if (schemedEndpoint == null || schemedEndpoint.isBlank())
+            throw new IllegalArgumentException("legacy ctor: endpoint required");
+        if (keyPrefix == null || keyPrefix.isBlank())
+            throw new IllegalArgumentException("legacy ctor: keyPrefix required");
+
+        int slash = schemedEndpoint.indexOf('/');
+        ZenohTransport t;
+        String hostPort;
+        if (slash <= 0) {
+            t = ZenohTransport.TCP;
+            hostPort = schemedEndpoint.trim();
+        } else {
+            String scheme = schemedEndpoint.substring(0, slash).trim();
+            t = ZenohTransport.fromScheme(scheme);
+            if (t == null) t = ZenohTransport.TCP;
+            hostPort = schemedEndpoint.substring(slash + 1).trim();
+        }
+        return Connector.newZenoh("legacy",
+                t, hostPort, "", keyPrefix,
+                com.adsb.core.PayloadFormat.COT,
+                mode == null ? ZenohMode.PER_AIRCRAFT : mode,
+                null, null, null, false, true);
+    }
+
     private static String trimSlashes(String s) {
         int start = 0, end = s.length();
         while (start < end && s.charAt(start) == '/') start++;
