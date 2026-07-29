@@ -121,7 +121,8 @@ public final class MainFrame extends JFrame {
                 initialAffil, initialCat, initialStaleAir, initialStaleGround,
                 (aff, cat, sa, sg) -> {
                     liveBuilder.set(new CoTBuilder(new IcaoAircraftClassifier(aff, cat), sa, sg));
-                });
+                },
+                mapPanel::setBrightness);
         this.aboutPanel       = new AboutPanel(version);
 
         this.sideDock = new SideDock(mapPanel);

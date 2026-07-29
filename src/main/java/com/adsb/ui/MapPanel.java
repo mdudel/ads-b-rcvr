@@ -17,16 +17,16 @@ import javax.swing.JLayeredPane;
 import javax.swing.JPanel;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
+import java.awt.AlphaComposite;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
+import java.awt.Composite;
 import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
-import java.awt.event.ComponentAdapter;
-import java.awt.event.ComponentEvent;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
@@ -56,6 +56,7 @@ public final class MapPanel extends JPanel {
     private volatile boolean repaintPending;
     private volatile boolean hasAutoFit;
     private final Timer repaintCoalescer;
+    private volatile float mapBrightness = 1.0f;  // 0.0=black, 1.0=normal
 
     public MapPanel(AircraftStateStore store) {
         super(new BorderLayout());
@@ -141,8 +142,8 @@ public final class MapPanel extends JPanel {
         layered.add(mapComp, JLayeredPane.DEFAULT_LAYER);
         layered.add(nav,     JLayeredPane.PALETTE_LAYER);
 
-        layered.addComponentListener(new ComponentAdapter() {
-            @Override public void componentResized(ComponentEvent e) {
+        layered.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override public void componentResized(java.awt.event.ComponentEvent e) {
                 mapComp.setBounds(0, 0, layered.getWidth(), layered.getHeight());
                 Dimension pref = nav.getPreferredSize();
                 int inset = 12;
@@ -159,6 +160,16 @@ public final class MapPanel extends JPanel {
         if (t == null || !t.hasPosition()) return;
         SwingUtilities.invokeLater(() ->
                 map.setAddressLocation(new GeoPosition(t.latitude(), t.longitude())));
+    }
+
+    /**
+     * Set map brightness multiplier. 1.0 = normal (default), 0.0 = fully black.
+     * Applied via {@link AlphaComposite} over the tile layer so the tiles appear
+     * dimmed. Thread-safe; triggers a repaint.
+     */
+    public void setBrightness(float brightness) {
+        this.mapBrightness = Math.max(0.0f, Math.min(1.0f, brightness));
+        repaintPending = true;
     }
 
     /** Re-centre + zoom to roughly encompass currently-positioned tracks. */
@@ -186,6 +197,15 @@ public final class MapPanel extends JPanel {
                 g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                         RenderingHints.VALUE_ANTIALIAS_ON);
 
+                // Apply brightness dimming to the tile layer beneath
+                if (mapBrightness < 1.0f) {
+                    Composite oldComp = g.getComposite();
+                    g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1.0f - mapBrightness));
+                    g.setColor(Color.BLACK);
+                    g.fillRect(0, 0, width, height);
+                    g.setComposite(oldComp);
+                }
+
                 Rectangle vp = viewer.getViewportBounds();
                 Font labelFont = g.getFont().deriveFont(Font.PLAIN, 10f);
                 g.setFont(labelFont);
@@ -206,8 +226,28 @@ public final class MapPanel extends JPanel {
                     int y = (int) (p.getY() - vp.y);
                     if (x < -20 || y < -20 || x > width + 20 || y > height + 20) continue;
 
-                    double heading = Double.isNaN(t.trackDeg()) ? 0.0 : t.trackDeg();
                     Color c = altitudeColour(t.preferredAltFt());
+
+                    // Draw trail first (behind the aircraft icon)
+                    List<AircraftStateStore.TrailPoint> trail = store.getTrail(t.icaoHex());
+                    if (trail.size() > 1) {
+                        g.setColor(c);
+                        for (int i = 1; i < trail.size(); i++) {
+                            AircraftStateStore.TrailPoint p1 = trail.get(i - 1);
+                            AircraftStateStore.TrailPoint p2 = trail.get(i);
+                            Point2D px1 = viewer.getTileFactory().geoToPixel(
+                                    new GeoPosition(p1.lat(), p1.lon()), viewer.getZoom());
+                            Point2D px2 = viewer.getTileFactory().geoToPixel(
+                                    new GeoPosition(p2.lat(), p2.lon()), viewer.getZoom());
+                            int x1 = (int) (px1.getX() - vp.x);
+                            int y1 = (int) (px1.getY() - vp.y);
+                            int x2 = (int) (px2.getX() - vp.x);
+                            int y2 = (int) (px2.getY() - vp.y);
+                            g.drawLine(x1, y1, x2, y2);
+                        }
+                    }
+
+                    double heading = Double.isNaN(t.trackDeg()) ? 0.0 : t.trackDeg();
                     drawAircraftGlyph(g, x, y, heading, c);
 
                     String label = t.callsign() != null && !t.callsign().isBlank()
@@ -222,8 +262,8 @@ public final class MapPanel extends JPanel {
         }
     }
 
-    private static void drawAircraftGlyph(Graphics2D g, int cx, int cy,
-                                           double headingDeg, Color fill) {
+    private void drawAircraftGlyph(Graphics2D g, int cx, int cy,
+                                    double headingDeg, Color fill) {
         AffineTransform old = g.getTransform();
         try {
             g.translate(cx, cy);
@@ -243,7 +283,7 @@ public final class MapPanel extends JPanel {
         }
     }
 
-    private static Color altitudeColour(int altFt) {
+    private Color altitudeColour(int altFt) {
         if (altFt == Integer.MIN_VALUE) return Color.LIGHT_GRAY;
         if (altFt <   5000) return new Color(0xC0, 0x39, 0x2B);
         if (altFt <  10000) return new Color(0xE6, 0x7E, 0x22);

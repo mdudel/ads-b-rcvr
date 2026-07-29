@@ -2,6 +2,9 @@ package com.adsb.model;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +35,16 @@ public final class AircraftStateStore {
 
     /** Map of ICAO-hex (uppercase) -&gt; latest snapshot. */
     private final Map<String, AdsbTrack> tracks = new ConcurrentHashMap<>();
+
+    /**
+     * Position history per ICAO (for map trail rendering). Each deque holds
+     * up to {@link #MAX_TRAIL_POINTS} recent lat/lon pairs. Evicted along with
+     * the main track on TTL expiry.
+     */
+    private final Map<String, Deque<TrailPoint>> trails = new ConcurrentHashMap<>();
+
+    /** Max trail points to retain per aircraft. ~50 = 5 min at 6s update rate. */
+    private static final int MAX_TRAIL_POINTS = 50;
 
     /** Snapshot listeners. Copy-on-write so add/remove is safe under concurrent publish. */
     private final List<Consumer<AdsbTrack>> listeners = new CopyOnWriteArrayList<>();
@@ -74,6 +87,21 @@ public final class AircraftStateStore {
             return b.build();
         });
 
+        // Append new position to trail if it's valid and different from last
+        if (next.hasPosition()) {
+            trails.compute(key, (k, trail) -> {
+                if (trail == null) trail = new ArrayDeque<>(MAX_TRAIL_POINTS + 1);
+                // Only add if position changed (avoid duplicates when only alt/speed updated)
+                if (trail.isEmpty() ||
+                    trail.getLast().lat != next.latitude() ||
+                    trail.getLast().lon != next.longitude()) {
+                    trail.addLast(new TrailPoint(next.latitude(), next.longitude()));
+                    if (trail.size() > MAX_TRAIL_POINTS) trail.removeFirst();
+                }
+                return trail;
+            });
+        }
+
         // Broadcast outside the compute() lambda so listeners aren't holding the
         // per-key lock while they publish downstream (which may involve socket I/O).
         for (Consumer<AdsbTrack> l : listeners) {
@@ -108,6 +136,17 @@ public final class AircraftStateStore {
     }
 
     /**
+     * @return immutable snapshot of the trail for the given ICAO, or an empty
+     *         list if no trail exists. Each point is a lat/lon pair in the
+     *         order they were received (oldest first).
+     */
+    public List<TrailPoint> getTrail(String icaoHex) {
+        if (icaoHex == null) return Collections.emptyList();
+        Deque<TrailPoint> trail = trails.get(icaoHex.toUpperCase());
+        return trail == null ? Collections.emptyList() : List.copyOf(trail);
+    }
+
+    /**
      * Drop tracks whose {@code lastSeen} is older than {@code now - maxAge}.
      * Intended for periodic housekeeping; safe to call while updates are
      * flowing in on other threads.
@@ -120,8 +159,11 @@ public final class AircraftStateStore {
         int removed = 0;
         Iterator<Map.Entry<String, AdsbTrack>> it = tracks.entrySet().iterator();
         while (it.hasNext()) {
-            if (it.next().getValue().lastSeen().isBefore(cutoff)) {
+            Map.Entry<String, AdsbTrack> e = it.next();
+            if (e.getValue().lastSeen().isBefore(cutoff)) {
+                String icao = e.getKey();
                 it.remove();
+                trails.remove(icao);  // Evict trail with the track
                 removed++;
             }
         }
@@ -133,4 +175,7 @@ public final class AircraftStateStore {
     public interface Updater {
         void apply(AdsbTrack.Builder builder);
     }
+
+    /** One position point in an aircraft's trail history. */
+    public record TrailPoint(double lat, double lon) {}
 }

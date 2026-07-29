@@ -7,6 +7,7 @@ import javax.swing.BorderFactory;
 import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JSlider;
 import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
 import java.awt.GridBagConstraints;
@@ -35,11 +36,13 @@ public final class SettingsPanel extends JPanel {
     private final JComboBox<IcaoAircraftClassifier.Category>    catBox;
     private final JSpinner staleAirSpin;
     private final JSpinner staleGroundSpin;
+    private final JSlider brightnessSlider;
 
     public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
                          IcaoAircraftClassifier.Category    initialCat,
                          int initialStaleAir, int initialStaleGround,
-                         SettingsListener onChange) {
+                         SettingsListener onChange,
+                         java.util.function.Consumer<Float> onBrightnessChanged) {
         super(new GridBagLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
@@ -53,6 +56,13 @@ public final class SettingsPanel extends JPanel {
 
         this.staleAirSpin    = new JSpinner(new SpinnerNumberModel(initialStaleAir,    5,  3600, 5));
         this.staleGroundSpin = new JSpinner(new SpinnerNumberModel(initialStaleGround, 5, 86400, 30));
+
+        this.brightnessSlider = new JSlider(JSlider.HORIZONTAL, 0, 100, 100);
+        brightnessSlider.setMajorTickSpacing(25);
+        brightnessSlider.setMinorTickSpacing(5);
+        brightnessSlider.setPaintTicks(true);
+        brightnessSlider.setPaintLabels(true);
+        brightnessSlider.setToolTipText("Adjust map brightness (0=dark, 100=normal)");
 
         GridBagConstraints gc = new GridBagConstraints();
         gc.insets = new Insets(4, 4, 4, 4);
@@ -72,6 +82,9 @@ public final class SettingsPanel extends JPanel {
         gc.gridx = 0; gc.gridy = y; add(new JLabel("Stale ground (s):"), gc);
         gc.gridx = 1;                add(staleGroundSpin,                 gc);
         y++;
+        gc.gridx = 0; gc.gridy = y; add(new JLabel("Map brightness:"),   gc);
+        gc.gridx = 1;                add(brightnessSlider,                gc);
+        y++;
 
         // Fill remaining vertical space so widgets sit at the top.
         gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2; gc.weighty = 1.0;
@@ -89,6 +102,13 @@ public final class SettingsPanel extends JPanel {
         catBox.addActionListener(push);
         staleAirSpin.addChangeListener(e -> push.actionPerformed(null));
         staleGroundSpin.addChangeListener(e -> push.actionPerformed(null));
+
+        if (onBrightnessChanged != null) {
+            brightnessSlider.addChangeListener(e -> {
+                float brightness = brightnessSlider.getValue() / 100.0f;
+                onBrightnessChanged.accept(brightness);
+            });
+        }
     }
 
     /** Fired whenever any settings widget changes. */
