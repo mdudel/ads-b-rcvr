@@ -141,16 +141,15 @@ public final class ConnectorAttacher {
                 return t;
             }
             case ZENOH: {
-                // Target format: 'endpoint;key-prefix', e.g.
-                //   tcp/localhost:7447;adsb/cot
-                // Split on the FIRST semicolon so key prefixes may contain
-                // slashes (well-formed Zenoh key expressions do) but not
-                // semicolons (which aren't valid in Zenoh keys anyway).
-                String[] ek = splitEndpointAndKey(target, "Zenoh target");
-                // ZenohMode is a first-class Connector field, not part of
-                // the target string. Null-safe because the Connector
-                // canonical ctor coerces null to PER_AIRCRAFT.
-                return new ZenohForwarder(ek[0], ek[1], c.zenohMode());
+                // Post-2026-07-29-refactor: every Zenoh field lives on
+                // the Connector record as its own typed member
+                // (transport, endpoint, org, keyExpr, TLS material).
+                // ZenohForwarder consumes the whole record; no target-
+                // string parsing here. The legacy 'endpoint;key-prefix'
+                // target string is dead -- ConnectorStore drops rows
+                // using that shape at load time (see Marty 2026-07-29
+                // 14:01 UTC nuke-and-fresh-start policy).
+                return new ZenohForwarder(c);
             }
             default:
                 throw new IllegalArgumentException("unknown connector type: " + c.type());
@@ -165,11 +164,16 @@ public final class ConnectorAttacher {
     }
 
     /**
-     * Split an {@code endpoint;key} connector target into its two halves,
-     * validating that both are non-empty. Used only by the Zenoh case;
-     * lifted out so its parsing rules can be unit-tested directly.
-     * Package-private for tests.
+     * Split an {@code endpoint;key} connector target into its two halves.
+     * Retained after the 2026-07-29 refactor for backward compatibility
+     * with any external test still calling this helper; the internal
+     * ZENOH attach path no longer uses it. Package-private for tests.
+     *
+     * @deprecated the new-schema Zenoh fields on {@link Connector} make
+     *             this parser unnecessary; kept only until existing
+     *             tests that call it are retired.
      */
+    @Deprecated
     static String[] splitEndpointAndKey(String s, String label) {
         if (s == null) throw new IllegalArgumentException(label + " is null");
         int i = s.indexOf(';');
