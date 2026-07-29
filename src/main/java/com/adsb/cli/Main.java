@@ -5,6 +5,7 @@ import com.adsb.core.AdsbReceiver;
 import com.adsb.core.FilterMode;
 import com.adsb.core.PayloadFormat;
 import com.adsb.core.SinkRegistry;
+import com.adsb.transport.CoTDebugForwarder;
 import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
 import com.adsb.cot.IcaoAircraftClassifier.Affiliation;
@@ -140,6 +141,44 @@ public class Main {
                             c.name(), e.getMessage());
                 }
             }
+        }
+
+        // CoT debug console sink (Marty 2026-07-29 10:34 UTC).
+        // Attached AFTER normal connectors so its output arrives adjacent
+        // to whatever the operator is running -- easy to correlate with
+        // WARN lines from the adapter or with UDP tx activity.
+        if (cfg.cotDebug) {
+            java.util.regex.Pattern icaoRe = null;
+            if (cfg.cotDebugIcaoRegex != null) {
+                try { icaoRe = java.util.regex.Pattern.compile(cfg.cotDebugIcaoRegex,
+                        java.util.regex.Pattern.CASE_INSENSITIVE); }
+                catch (Exception e) {
+                    System.err.println("[WARN] --cot-debug-icao regex invalid, ignoring: " + e);
+                }
+            }
+            CoTDebugForwarder debug = new CoTDebugForwarder(System.out,
+                    cfg.cotDebugPretty, cfg.cotDebugRateMs, icaoRe);
+            String id = "cot-debug-console";
+            sinks.add(id, PayloadFormat.COT, debug);
+            // Install a state-store listener mirroring ConnectorAttacher's
+            // CoT wiring path -- CoT flows via state-store listener, not the
+            // per-frame dispatch loop. Same shape as attacher: build XML from
+            // the snapshot, hand to the forwarder.
+            stateStore.addListener(snap -> {
+                com.adsb.cot.CoTBuilder b = liveBuilder.get();
+                if (b == null) return;
+                String xml = b.build(snap);
+                if (xml == null) return;
+                try { debug.forward(xml.getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
+                catch (Exception e) {
+                    System.err.println("[WARN] CoT debug console error: " + e);
+                }
+            });
+            System.out.printf(
+                    "[INFO] CoT debug console: attached (%s, rate-limit %s, filter %s)%n",
+                    cfg.cotDebugPretty ? "pretty" : "single-line",
+                    cfg.cotDebugRateMs > 0 ? cfg.cotDebugRateMs + "ms" : "none",
+                    cfg.cotDebugIcaoRegex == null ? "all" : cfg.cotDebugIcaoRegex);
         }
 
         // Optional UI. Opens on the EDT so the receiver doesn't block on it.
@@ -378,6 +417,21 @@ public class Main {
                     cfg.filterMode = FilterMode.fromString(args[++i]);
                     cfg.filterModeExplicit = true;
                     break;
+                case "--cot-debug":
+                    cfg.cotDebug = true;
+                    break;
+                case "--cot-debug-pretty":
+                    cfg.cotDebug = true;
+                    cfg.cotDebugPretty = true;
+                    break;
+                case "--cot-debug-rate-ms":
+                    cfg.cotDebug = true;
+                    cfg.cotDebugRateMs = Long.parseLong(args[++i]);
+                    break;
+                case "--cot-debug-icao":
+                    cfg.cotDebug = true;
+                    cfg.cotDebugIcaoRegex = args[++i];
+                    break;
                 case "-h": case "--help":
                     printUsage();
                     System.exit(0);
@@ -435,6 +489,21 @@ public class Main {
                                           Default: civilian
               --cot-stale-air <seconds>   Airborne stale offset (default 30)
               --cot-stale-ground <seconds>  Ground stale offset (default 120)
+
+            CoT debug console (Marty 2026-07-29 10:34 UTC):
+              --cot-debug                  Stream every emitted CoT event
+                                          to stdout. Sees exactly what goes
+                                          on the wire to UDP/multicast/TCP.
+              --cot-debug-pretty           Indent XML across multiple lines
+                                          (easier to read in a terminal).
+                                          Enables --cot-debug automatically.
+              --cot-debug-rate-ms <N>      Emit at most one line per ICAO per
+                                          N milliseconds (recommend 5000 for
+                                          a busy sky). Enables --cot-debug.
+              --cot-debug-icao <REGEX>     Only emit for ICAOs matching this
+                                          regex, e.g. 4B3810|471DB5 to tail
+                                          two specific glitchy targets.
+                                          Enables --cot-debug.
 
             Anti-jump position filter:
               --filter-mode <kinematic|geofence|both|off>
@@ -510,6 +579,16 @@ public class Main {
         FilterMode filterMode = FilterMode.KINEMATIC;
         /** True when --filter-mode was passed on the CLI (persist it, override any saved value). */
         boolean filterModeExplicit = false;
+
+        // ------ CoT debug console (Marty 2026-07-29 10:34 UTC) ------
+        /** Print every emitted CoT event to stdout for eyeball debugging. */
+        boolean cotDebug        = false;
+        /** Pretty-print the CoT XML across multiple indented lines. */
+        boolean cotDebugPretty  = false;
+        /** Rate-limit per-ICAO in ms. 0 = every event. Default 0. */
+        long    cotDebugRateMs  = 0L;
+        /** Regex filter on ICAO hex; null = all aircraft. Case-insensitive. */
+        String  cotDebugIcaoRegex = null;
 
         boolean hasAnyForwarder() {
             return udpHost != null || multicastGroup != null || tcpPort > 0;
