@@ -45,6 +45,7 @@ import java.util.function.Supplier;
  */
 public final class SettingsPanel extends JPanel {
 
+    private final Consumer<double[]> onSmoothingTuningChanged;
     private final JComboBox<IcaoAircraftClassifier.Affiliation> affilBox;
     private final JComboBox<IcaoAircraftClassifier.Category>    catBox;
     private final JSpinner staleAirSpin;
@@ -108,7 +109,28 @@ public final class SettingsPanel extends JPanel {
                          TrackSmoothingRegistry smoothing,
                          boolean initialSmoothingEnabled,
                          Consumer<Boolean> onSmoothingChanged) {
+        this(initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                onChange, onBrightnessChanged, initialBrightness,
+                enrichment, enrichmentDirRef, enrichmentDirSetter,
+                smoothing, initialSmoothingEnabled, onSmoothingChanged,
+                null);
+    }
+
+    public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
+                         IcaoAircraftClassifier.Category    initialCat,
+                         int initialStaleAir, int initialStaleGround,
+                         SettingsListener onChange,
+                         java.util.function.Consumer<Float> onBrightnessChanged,
+                         float initialBrightness,
+                         EnrichmentResolver enrichment,
+                         Supplier<String> enrichmentDirRef,
+                         Consumer<String> enrichmentDirSetter,
+                         TrackSmoothingRegistry smoothing,
+                         boolean initialSmoothingEnabled,
+                         Consumer<Boolean> onSmoothingChanged,
+                         Consumer<double[]> onSmoothingTuningChanged) {
         super(new GridBagLayout());
+        this.onSmoothingTuningChanged = onSmoothingTuningChanged;
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
         this.affilBox = new JComboBox<>(IcaoAircraftClassifier.Affiliation.values());
@@ -236,7 +258,9 @@ public final class SettingsPanel extends JPanel {
             y++;
         }
 
-        // Track-smoothing toggle (Marty 2026-07-30 15:27 UTC, #16).
+        // Track-smoothing toggle + tuning knobs (Marty 2026-07-30
+        // 15:27 UTC #16; knobs added 15:44 UTC after 'jerky + sometimes
+        // backward' feedback).
         // Only shown when a registry was supplied; hidden in test /
         // headless bootstraps that don't wire one.
         if (smoothing != null) {
@@ -245,12 +269,12 @@ public final class SettingsPanel extends JPanel {
             gc.gridwidth = 1;
             y++;
             JCheckBox smoothToggle = new JCheckBox(
-                    "Smooth track paths (Kalman)", initialSmoothingEnabled);
+                    "Smooth track history trail (Kalman)", initialSmoothingEnabled);
             smoothToggle.setFocusable(false);
             smoothToggle.setToolTipText(
-                    "Apply a per-aircraft Kalman filter to displayed"
-                    + " positions + history trail. Display only --"
-                    + " store, table, popup, and CoT emissions stay raw.");
+                    "Apply a per-aircraft Kalman filter to the HISTORY TRAIL."
+                    + " The current-position icon always reads raw ground"
+                    + " truth. Store, table, popup, and CoT emissions stay raw.");
             smoothToggle.addActionListener(e -> {
                 boolean on = smoothToggle.isSelected();
                 smoothing.setEnabled(on);
@@ -259,6 +283,47 @@ public final class SettingsPanel extends JPanel {
             gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2;
             add(smoothToggle, gc);
             gc.gridwidth = 1;
+            y++;
+
+            // Tuning knobs. Values are in units of 1e-5 deg (or
+            // deg/sec^2) so the spinner reads in nicer whole numbers.
+            // Process noise: 1..30 (=> 1e-5 .. 3e-4). Bigger => more
+            //   responsive to manoeuvres, less smooth.
+            // Measurement noise: 1..50 (=> 1e-5 .. 5e-4). Bigger => more
+            //   smoothing (filter trusts measurement less).
+            double pnInit = smoothing.getProcessNoiseSigma()     * 1e5;
+            double mnInit = smoothing.getMeasurementNoiseSigma() * 1e5;
+            javax.swing.JSpinner procSpin = new javax.swing.JSpinner(
+                    new javax.swing.SpinnerNumberModel(
+                            Math.max(1.0, Math.min(30.0, pnInit)),
+                            1.0, 30.0, 0.5));
+            javax.swing.JSpinner measSpin = new javax.swing.JSpinner(
+                    new javax.swing.SpinnerNumberModel(
+                            Math.max(1.0, Math.min(50.0, mnInit)),
+                            1.0, 50.0, 0.5));
+            procSpin.setToolTipText(
+                    "Process noise × 1e-5 deg/sec². Bigger = filter reacts"
+                    + " quicker to real manoeuvres; smaller = smoother, laggier.");
+            measSpin.setToolTipText(
+                    "Measurement noise × 1e-5 deg. Bigger = filter trusts"
+                    + " each fix less, so smoother trail; smaller = tighter to raw.");
+
+            Runnable pushTuning = () -> {
+                double pn = ((Number) procSpin.getValue()).doubleValue() * 1e-5;
+                double mn = ((Number) measSpin.getValue()).doubleValue() * 1e-5;
+                smoothing.setTuning(pn, mn);
+                if (onSmoothingTuningChanged != null) {
+                    onSmoothingTuningChanged.accept(new double[] { pn, mn });
+                }
+            };
+            procSpin.addChangeListener(e -> pushTuning.run());
+            measSpin.addChangeListener(e -> pushTuning.run());
+
+            gc.gridx = 0; gc.gridy = y; add(new JLabel("Process noise (×1e-5):"),     gc);
+            gc.gridx = 1;                add(procSpin,                                 gc);
+            y++;
+            gc.gridx = 0; gc.gridy = y; add(new JLabel("Measurement noise (×1e-5):"), gc);
+            gc.gridx = 1;                add(measSpin,                                 gc);
             y++;
         }
 

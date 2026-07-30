@@ -133,7 +133,7 @@ public final class TrackKalmanFilterTest {
         // Pin the tunables so a rename doesn't silently change the
         // filter's aggressiveness.
         assertEquals(30.0,     TrackKalmanFilter.MAX_DT_RESET_SEC);
-        assertEquals(3.0e-5,   TrackKalmanFilter.PROCESS_NOISE_SIGMA);
-        assertEquals(1.35e-4,  TrackKalmanFilter.MEASUREMENT_NOISE_SIGMA);
+        assertEquals(3.0e-5,   TrackKalmanFilter.DEFAULT_PROCESS_NOISE_SIGMA);
+        assertEquals(1.35e-4,  TrackKalmanFilter.DEFAULT_MEASUREMENT_NOISE_SIGMA);
     }
 }

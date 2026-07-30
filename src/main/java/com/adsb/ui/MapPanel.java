@@ -358,16 +358,18 @@ public final class MapPanel extends JPanel {
                     float alpha = AircraftStateStore.fadeAlphaFor(t, paintNow);
                     if (alpha <= 0.0f) continue;
 
-                    // Kalman smoothing (Marty 2026-07-30 15:27 UTC #16):
-                    // pipe the reported lat/lon through the per-aircraft
-                    // filter before projecting so both the icon AND its
-                    // trail read as a clean curve rather than a jaggy
-                    // sample-by-sample line. Store data unchanged --
-                    // this is a display-only smoother.
-                    double[] smoothed = applySmoothing(t.icaoHex(),
+                    // Kalman smoothing (Marty 2026-07-30 15:27 UTC #16,
+                    // revised 15:44 UTC): feed the reported position
+                    // through the filter so its trail buffer stays
+                    // populated, but paint the ICON at the RAW reported
+                    // position. Marty's concern was that a laggy filter
+                    // made the current-position glyph jerky and even
+                    // backward-appearing in some frames. The trail alone
+                    // is smoothed; the icon reads live ground-truth.
+                    applySmoothing(t.icaoHex(),
                             t.latitude(), t.longitude(), t.lastSeen());
                     Point2D p = viewer.getTileFactory().geoToPixel(
-                            new GeoPosition(smoothed[0], smoothed[1]),
+                            new GeoPosition(t.latitude(), t.longitude()),
                             viewer.getZoom());
                     int x = (int) (p.getX() - vp.x);
                     int y = (int) (p.getY() - vp.y);

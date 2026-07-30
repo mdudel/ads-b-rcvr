@@ -128,13 +128,18 @@ public class Main {
         // restart (Marty 2026-07-30 07:26 UTC).
         final float initialMapBrightness = readMapBrightness(storePath);
 
-        // Track smoothing registry (Marty 2026-07-30 15:27 UTC, #16).
+        // Track smoothing registry (Marty 2026-07-30 15:27 UTC #16;
+        // tuning knobs added 15:44 UTC).
         // Off by default (issue asks for a TOGGLE); operator flips it
-        // in Settings, choice persists via ui.trackSmoothing.
+        // in Settings, choice persists via ui.trackSmoothing. Tuning
+        // sigmas persist via ui.trackSmoothingProcSigma /
+        // ui.trackSmoothingMeasSigma.
         final boolean initialSmoothing = readTrackSmoothing(storePath);
+        final double[] initialSigmas   = readSmoothingTuning(storePath);
         final TrackSmoothingRegistry smoothingRegistry;
         if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
-            smoothingRegistry = new TrackSmoothingRegistry(initialSmoothing);
+            smoothingRegistry = new TrackSmoothingRegistry(
+                    initialSmoothing, initialSigmas[0], initialSigmas[1]);
         } else {
             smoothingRegistry = null;
         }
@@ -291,7 +296,8 @@ public class Main {
                             },
                             smoothingRegistry,
                             initialSmoothing,
-                            on -> writeTrackSmoothing(storePath, on));
+                            on -> writeTrackSmoothing(storePath, on),
+                            sigmas -> writeSmoothingTuning(storePath, sigmas[0], sigmas[1]));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -570,6 +576,38 @@ public class Main {
 
     private static void writeTrackSmoothing(Path storePath, boolean on) {
         writeUiProperty(storePath, "ui.trackSmoothing", Boolean.toString(on));
+    }
+
+    /**
+     * Read the Kalman tuning sigmas (process, measurement) from the
+     * properties file, defaulting to the filter's built-in defaults
+     * on any missing / unparseable value. Fixed-locale (ROOT) format
+     * on the write side so a de-DE JVM can round-trip its own writes.
+     */
+    private static double[] readSmoothingTuning(Path storePath) {
+        double pn = com.adsb.model.TrackKalmanFilter.DEFAULT_PROCESS_NOISE_SIGMA;
+        double mn = com.adsb.model.TrackKalmanFilter.DEFAULT_MEASUREMENT_NOISE_SIGMA;
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return new double[] { pn, mn };
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            String vp = p.getProperty("ui.trackSmoothingProcSigma");
+            String vm = p.getProperty("ui.trackSmoothingMeasSigma");
+            if (vp != null && !vp.isBlank()) pn = Double.parseDouble(vp.trim());
+            if (vm != null && !vm.isBlank()) mn = Double.parseDouble(vm.trim());
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.trackSmoothing tuning: " + e);
+        }
+        return new double[] { pn, mn };
+    }
+
+    private static void writeSmoothingTuning(Path storePath, double procSigma, double measSigma) {
+        writeUiProperty(storePath, "ui.trackSmoothingProcSigma",
+                String.format(java.util.Locale.ROOT, "%.6g", procSigma));
+        writeUiProperty(storePath, "ui.trackSmoothingMeasSigma",
+                String.format(java.util.Locale.ROOT, "%.6g", measSigma));
     }
 
     /**

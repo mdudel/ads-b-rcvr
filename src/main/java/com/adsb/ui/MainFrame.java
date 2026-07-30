@@ -189,6 +189,9 @@ public final class MainFrame extends JFrame {
                 null, false, b -> {});
     }
 
+    /**
+     * Legacy 22-arg ctor: no tuning callback.
+     */
     public MainFrame(String version,
                      AircraftStateStore store,
                      ConnectorStore connectorStore,
@@ -210,6 +213,38 @@ public final class MainFrame extends JFrame {
                      TrackSmoothingRegistry smoothing,
                      boolean initialSmoothingEnabled,
                      Consumer<Boolean> onSmoothingChanged) {
+        this(version, store, connectorStore, attacher, liveBuilder,
+                initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                initialTheme, onThemeChanged, receiver,
+                lastCertDirRef, lastCertDirSetter,
+                initialMapBrightness, onMapBrightnessChanged,
+                enrichment, enrichmentDirRef, enrichmentDirSetter,
+                smoothing, initialSmoothingEnabled, onSmoothingChanged,
+                sigmas -> {});
+    }
+
+    public MainFrame(String version,
+                     AircraftStateStore store,
+                     ConnectorStore connectorStore,
+                     ConnectorAttacher attacher,
+                     AtomicReference<CoTBuilder> liveBuilder,
+                     IcaoAircraftClassifier.Affiliation initialAffil,
+                     IcaoAircraftClassifier.Category    initialCat,
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver,
+                     java.util.function.Supplier<String> lastCertDirRef,
+                     java.util.function.Consumer<String> lastCertDirSetter,
+                     float initialMapBrightness,
+                     Consumer<Float> onMapBrightnessChanged,
+                     EnrichmentResolver enrichment,
+                     java.util.function.Supplier<String> enrichmentDirRef,
+                     java.util.function.Consumer<String> enrichmentDirSetter,
+                     TrackSmoothingRegistry smoothing,
+                     boolean initialSmoothingEnabled,
+                     Consumer<Boolean> onSmoothingChanged,
+                     Consumer<double[]> onSmoothingTuningChanged) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -270,7 +305,8 @@ public final class MainFrame extends JFrame {
                 enrichmentDirSetter,
                 smoothing,
                 initialSmoothingEnabled,
-                onSmoothingChanged);
+                onSmoothingChanged,
+                onSmoothingTuningChanged);
         this.aboutPanel       = new AboutPanel(version);
 
         this.sideDock = new SideDock(mapPanel);

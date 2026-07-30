@@ -49,26 +49,38 @@ public final class TrackKalmanFilter {
     public static final double MAX_DT_RESET_SEC = 30.0;
 
     /**
-     * Process noise sigma per axis in degrees/sec^2 (small: aircraft
-     * change velocity slowly relative to the ~5 s update cadence).
-     * Injected via a discretised constant-white-noise-acceleration
-     * model: Q = G * G^T * sigma^2 where G = [dt^2/2, dt, dt^2/2, dt].
-     *
-     * <p>Tuned for VISUAL smoothing (Marty's ask): favour trust in
-     * the constant-velocity model over trust in each individual
-     * measurement so the trail reads as a clean curve rather than a
-     * jaggy line. A pure-tracking application (e.g. downstream C2
-     * that needs low-latency response to manoeuvres) would want a
-     * larger sigma. Bump this up if the filter feels laggy through
-     * turns; drop it if the trail still looks jaggy.
+     * Default process noise sigma per axis in degrees/sec^2. Tuned
+     * for visual trail smoothing: favour trust in the constant-
+     * velocity model over each individual measurement so the trail
+     * reads as a clean curve. Larger sigma -&gt; more responsive to
+     * manoeuvres, less smooth. Smaller sigma -&gt; smoother, laggier.
      */
-    public static final double PROCESS_NOISE_SIGMA = 3.0e-5;
+    public static final double DEFAULT_PROCESS_NOISE_SIGMA = 3.0e-5;
 
     /**
-     * Measurement noise sigma per axis in degrees. ADS-B nominal
-     * accuracy is ~15 m; 15 m / 111_320 m/deg ~= 1.35e-4 deg.
+     * Default measurement noise sigma per axis in degrees. ADS-B
+     * nominal accuracy is ~15 m; 15 m / 111_320 m/deg ~= 1.35e-4 deg.
      */
-    public static final double MEASUREMENT_NOISE_SIGMA = 1.35e-4;
+    public static final double DEFAULT_MEASUREMENT_NOISE_SIGMA = 1.35e-4;
+
+    private final double processNoiseSigma;
+    private final double measurementNoiseSigma;
+
+    /** Default-tuned filter. Prefer {@link #TrackKalmanFilter(double, double)} for custom tuning. */
+    public TrackKalmanFilter() {
+        this(DEFAULT_PROCESS_NOISE_SIGMA, DEFAULT_MEASUREMENT_NOISE_SIGMA);
+    }
+
+    /**
+     * Custom tuning ctor.
+     *
+     * @param processNoiseSigma     sigma_q (deg/sec^2); larger =&gt; more responsive
+     * @param measurementNoiseSigma sigma_r (deg);       larger =&gt; more smoothing
+     */
+    public TrackKalmanFilter(double processNoiseSigma, double measurementNoiseSigma) {
+        this.processNoiseSigma = processNoiseSigma;
+        this.measurementNoiseSigma = measurementNoiseSigma;
+    }
 
     // 4-state x = [lat, lon, vlat, vlon]
     private double xLat, xLon, xVLat, xVLon;
@@ -144,7 +156,7 @@ public final class TrackKalmanFilter {
         // Initial covariance: uncertain about position by roughly
         // one measurement stddev (already a good fix), and very
         // uncertain about velocity until we see a second frame.
-        double rr = MEASUREMENT_NOISE_SIGMA * MEASUREMENT_NOISE_SIGMA;
+        double rr = measurementNoiseSigma * measurementNoiseSigma;
         double vv = 1.0; // 1 (deg/sec)^2 -- huge; drops fast after 2nd fix
         for (int i = 0; i < 16; i++) p[i] = 0.0;
         p[0]  = rr;   // P[lat,lat]
@@ -201,7 +213,7 @@ public final class TrackKalmanFilter {
         //                 [   0    dt^4/4    0   dt^3/2  ]
         //                 [ dt^3/2   0     dt^2    0     ]
         //                 [   0    dt^3/2    0    dt^2   ]
-        double s2 = PROCESS_NOISE_SIGMA * PROCESS_NOISE_SIGMA;
+        double s2 = processNoiseSigma * processNoiseSigma;
         double dt2 = dt * dt;
         double dt3 = dt2 * dt;
         double dt4 = dt3 * dt;
@@ -238,7 +250,7 @@ public final class TrackKalmanFilter {
         double yLon = zLon - xLon;
 
         // S = H P H^T + R = P[0..1, 0..1] + R
-        double r  = MEASUREMENT_NOISE_SIGMA * MEASUREMENT_NOISE_SIGMA;
+        double r  = measurementNoiseSigma * measurementNoiseSigma;
         double s00 = p[0]  + r;
         double s01 = p[1];
         double s10 = p[4];

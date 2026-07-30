@@ -43,6 +43,8 @@ public final class TrackSmoothingRegistry {
     private final Map<String, Deque<double[]>> smoothedTrails = new ConcurrentHashMap<>();
 
     private volatile boolean enabled;
+    private volatile double processNoiseSigma;
+    private volatile double measurementNoiseSigma;
 
     /** How long a filter can go without a measurement before eviction. */
     private static final long EVICT_STALE_SEC = 300;
@@ -51,7 +53,32 @@ public final class TrackSmoothingRegistry {
     private static final int MAX_TRAIL_POINTS = 100;
 
     public TrackSmoothingRegistry(boolean enabled) {
+        this(enabled,
+                TrackKalmanFilter.DEFAULT_PROCESS_NOISE_SIGMA,
+                TrackKalmanFilter.DEFAULT_MEASUREMENT_NOISE_SIGMA);
+    }
+
+    public TrackSmoothingRegistry(boolean enabled,
+                                  double processNoiseSigma,
+                                  double measurementNoiseSigma) {
         this.enabled = enabled;
+        this.processNoiseSigma = processNoiseSigma;
+        this.measurementNoiseSigma = measurementNoiseSigma;
+    }
+
+    public double getProcessNoiseSigma()     { return processNoiseSigma; }
+    public double getMeasurementNoiseSigma() { return measurementNoiseSigma; }
+
+    /**
+     * Retune the filter parameters. Existing filters are wiped so
+     * the new tuning takes effect on the next measurement -- keeping
+     * stale state around would blend old and new dynamics into a
+     * meaningless intermediate.
+     */
+    public void setTuning(double processNoiseSigma, double measurementNoiseSigma) {
+        this.processNoiseSigma = processNoiseSigma;
+        this.measurementNoiseSigma = measurementNoiseSigma;
+        clear();
     }
 
     public boolean isEnabled() {
@@ -86,7 +113,7 @@ public final class TrackSmoothingRegistry {
         if (!enabled || icaoHex == null) return new double[] { lat, lon };
         String key = icaoHex.toUpperCase();
         TrackKalmanFilter f = filters.computeIfAbsent(
-                key, k -> new TrackKalmanFilter());
+                key, k -> new TrackKalmanFilter(processNoiseSigma, measurementNoiseSigma));
         // Per-track serialisation: computeIfAbsent doesn't; explicit
         // synchronized on the filter guarantees only one update at a
         // time (paint calls should be sequential on the EDT anyway,

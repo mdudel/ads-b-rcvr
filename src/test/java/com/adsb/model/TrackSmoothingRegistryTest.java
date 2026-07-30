@@ -92,6 +92,38 @@ public final class TrackSmoothingRegistryTest {
     }
 
     @Test
+    void tuningIsHeldAndPropagatesToNewFilters() {
+        TrackSmoothingRegistry r = new TrackSmoothingRegistry(true, 5e-5, 2e-4);
+        assertEquals(5e-5, r.getProcessNoiseSigma(), 1e-12);
+        assertEquals(2e-4, r.getMeasurementNoiseSigma(), 1e-12);
+        // Filter created lazily on first smooth() call; its behaviour
+        // is covered by TrackKalmanFilterTest, but we can at least
+        // check that smooth() runs with the custom sigmas without
+        // throwing.
+        double[] out = r.smooth("3C6444", 50.0, 8.0,
+                java.time.Instant.parse("2026-07-30T15:00:00Z"));
+        assertEquals(50.0, out[0], 1e-12);
+        assertEquals( 8.0, out[1], 1e-12);
+    }
+
+    @Test
+    void setTuningWipesExistingFilters() {
+        // Populate two filters; then retune. Filters should be dropped
+        // so the next measurement builds a fresh state with the new
+        // sigmas -- prevents old and new dynamics blending into a
+        // meaningless intermediate.
+        TrackSmoothingRegistry r = new TrackSmoothingRegistry(true);
+        java.time.Instant t = java.time.Instant.parse("2026-07-30T15:00:00Z");
+        r.smooth("3C6444", 50.0, 8.0, t);
+        r.smooth("400123", 51.5, -0.1, t);
+        assertEquals(2, r.size());
+        r.setTuning(1e-4, 5e-4);
+        assertEquals(0, r.size());
+        assertEquals(1e-4, r.getProcessNoiseSigma(), 1e-12);
+        assertEquals(5e-4, r.getMeasurementNoiseSigma(), 1e-12);
+    }
+
+    @Test
     void removeIcaoDropsOne() {
         TrackSmoothingRegistry r = new TrackSmoothingRegistry(true);
         Instant t = Instant.parse("2026-07-30T15:00:00Z");
