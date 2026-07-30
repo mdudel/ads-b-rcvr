@@ -149,13 +149,13 @@ public final class ConnectorsPanel extends JPanel {
      * <p><b>Layout</b> (post-2026-07-30 07:2x UTC icon refactor):
      * <pre>
      *   +--------------------------------------------------+
-     *   | [\u25C0] [\u2699] [\u2715]  \u25CF Name                          |  (icon buttons first,
+     *   | [\u25B6] [\u2699] [\u2715]  \u25CF Name                          |  (icon buttons first,
      *   |                       Type -> long/topic [COT]   |   info stretches)
      *   +--------------------------------------------------+
      * </pre>
      *
      * <p>Marty 2026-07-30 07:21 UTC: replace the text buttons with
-     * flat icon glyphs. Toggle button flips between a green left-
+     * flat icon glyphs. Toggle button flips between a green right-
      * pointing triangle (start, when stopped) and a red square (stop,
      * when running). Edit = cog. Remove = X. All three are single
      * Unicode glyphs so no image assets ship in the jar and the icons
@@ -172,9 +172,9 @@ public final class ConnectorsPanel extends JPanel {
      */
     private JPanel buildRow(Connector c) {
         // --- Buttons (left side, always visible; flat icon glyphs) ---
-        // Toggle: green left-pointing triangle when stopped (click to start),
+        // Toggle: green right-pointing triangle when stopped (click to start),
         // red filled square when running (click to stop).
-        String toggleGlyph = c.enabled() ? "\u25A0" : "\u25C0";
+        String toggleGlyph = c.enabled() ? "\u25A0" : "\u25B6";
         Color  toggleColor = c.enabled() ? new Color(0xC0, 0x39, 0x2B)
                                          : new Color(0x27, 0xAE, 0x60);
         JButton toggleBtn = iconButton(toggleGlyph, toggleColor,
