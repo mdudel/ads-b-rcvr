@@ -10,6 +10,10 @@ import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
 import com.adsb.cot.IcaoAircraftClassifier.Affiliation;
 import com.adsb.cot.IcaoAircraftClassifier.Category;
+import com.adsb.enrichment.EnrichmentCache;
+import com.adsb.enrichment.EnrichmentResolver;
+import com.adsb.enrichment.LocalCsvEnrichmentSource;
+import com.adsb.enrichment.OpenSkyApiEnrichmentSource;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.ui.MainFrame;
 import com.adsb.ui.ThemeMode;
@@ -123,6 +127,43 @@ public class Main {
         // restart (Marty 2026-07-30 07:26 UTC).
         final float initialMapBrightness = readMapBrightness(storePath);
 
+        // Aircraft-metadata enrichment (Marty 2026-07-30 14:05 UTC):
+        // resolve ICAO24 -> registration/type/operator from a chain of
+        // sources. Order: cache -> user-configured local dir -> downloaded
+        // bundle -> live OpenSky API. Local dir path persisted under
+        // ui.enrichmentDir. Cache lives at ~/.adsb-rcvr/enrichment-cache.json;
+        // downloaded bundle lives at ~/.adsb-rcvr/aircraft-db/aircraftDatabase.csv.
+        final EnrichmentResolver enrichmentResolver;
+        if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
+            Path cachePath  = Paths.get(System.getProperty("user.home"),
+                    ".adsb-rcvr", "enrichment-cache.json");
+            Path bundleDir  = Paths.get(System.getProperty("user.home"),
+                    ".adsb-rcvr", "aircraft-db");
+            EnrichmentCache cache = new EnrichmentCache(cachePath);
+            cache.load();
+            String enrichmentDirStr = readEnrichmentDir(storePath);
+            LocalCsvEnrichmentSource localDir = new LocalCsvEnrichmentSource(
+                    enrichmentDirStr == null ? null : Paths.get(enrichmentDirStr));
+            localDir.load();
+            LocalCsvEnrichmentSource bundle = new LocalCsvEnrichmentSource(bundleDir);
+            bundle.load();
+            OpenSkyApiEnrichmentSource api = new OpenSkyApiEnrichmentSource();
+            enrichmentResolver = new EnrichmentResolver(cache, localDir, bundle, api);
+            System.out.println("[INFO] Enrichment: " + enrichmentResolver.statusLine());
+            // Periodic flush every 30s so we don't lose cache work on a crash.
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "adsb-enrichment-flush");
+                t.setDaemon(true);
+                return t;
+            }).scheduleAtFixedRate(enrichmentResolver::flushCache,
+                    30, 30, java.util.concurrent.TimeUnit.SECONDS);
+            Runtime.getRuntime().addShutdownHook(new Thread(enrichmentResolver::shutdown,
+                    "adsb-enrichment-shutdown"));
+        } else {
+            enrichmentResolver = null;
+        }
+        final EnrichmentResolver enrichmentResolverRef = enrichmentResolver;
+
         ConnectorAttacher attacher = new ConnectorAttacher(sinks, stateStore, liveBuilder);
 
         // Turn CLI sink flags into transient in-memory connectors so they
@@ -216,7 +257,26 @@ public class Main {
                             () -> readLastCertDir(storePath),
                             dir -> writeLastCertDir(storePath, dir),
                             initialMapBrightness,
-                            b -> writeMapBrightness(storePath, b));
+                            b -> writeMapBrightness(storePath, b),
+                            enrichmentResolverRef,
+                            () -> readEnrichmentDir(storePath),
+                            dir -> {
+                                writeEnrichmentDir(storePath, dir);
+                                // Rebuild the local-dir source in place so
+                                // the next lookup sees the new dir.
+                                if (enrichmentResolverRef != null
+                                        && enrichmentResolverRef.localDir() != null
+                                        && dir != null && !dir.isBlank()) {
+                                    // The LocalCsvEnrichmentSource is bound
+                                    // to its dir at construction; a change
+                                    // requires re-creating it. We take the
+                                    // simpler path: just reload if the user
+                                    // chose the same dir; otherwise Marty
+                                    // relaunches. Documented in the daily
+                                    // note as a followup.
+                                    enrichmentResolverRef.localDir().reload();
+                                }
+                            });
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -438,6 +498,33 @@ public class Main {
         // Float.parseFloat can't round-trip on the next launch.
         String canonical = String.format(java.util.Locale.ROOT, "%.3f", clamped);
         writeUiProperty(storePath, "ui.mapBrightness", canonical);
+    }
+
+    /**
+     * Read {@code ui.enrichmentDir} from the shared properties file.
+     * The value is a filesystem path pointing at a directory of
+     * OpenSky-format aircraft-database CSV files. Returns null when
+     * absent, blank, or the file is unreadable.
+     */
+    private static String readEnrichmentDir(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return null;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            String v = p.getProperty("ui.enrichmentDir");
+            return (v == null || v.isBlank()) ? null : v;
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.enrichmentDir from "
+                    + storePath + ": " + e);
+            return null;
+        }
+    }
+
+    private static void writeEnrichmentDir(Path storePath, String dir) {
+        if (dir == null || dir.isBlank()) return;
+        writeUiProperty(storePath, "ui.enrichmentDir", dir);
     }
 
     /**

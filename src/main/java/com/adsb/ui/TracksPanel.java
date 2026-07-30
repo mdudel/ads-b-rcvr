@@ -1,5 +1,7 @@
 package com.adsb.ui;
 
+import com.adsb.enrichment.Enrichment;
+import com.adsb.enrichment.EnrichmentResolver;
 import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.model.EmitterCategoryLabel;
@@ -38,13 +40,27 @@ import java.util.function.Consumer;
 public final class TracksPanel extends JPanel {
 
     private final AircraftStateStore store;
+    private final EnrichmentResolver enrichment;
     private final Model              model;
     private final JTable             table;
 
+    /**
+     * Legacy 2-arg ctor for callers that don't have an enrichment
+     * resolver (headless tests, pre-2026-07-30 shape). Defers to the
+     * 3-arg primary with a null resolver -- enrichment columns simply
+     * stay empty.
+     */
     public TracksPanel(AircraftStateStore store, Consumer<AdsbTrack> onRowSelected) {
+        this(store, null, onRowSelected);
+    }
+
+    public TracksPanel(AircraftStateStore store,
+                       EnrichmentResolver enrichment,
+                       Consumer<AdsbTrack> onRowSelected) {
         super(new BorderLayout());
         this.store = store;
-        this.model = new Model();
+        this.enrichment = enrichment;
+        this.model = new Model(enrichment);
         this.table = new JTable(model);
         table.setRowSorter(new TableRowSorter<>(model));
         table.setFillsViewportHeight(true);
@@ -122,6 +138,14 @@ public final class TracksPanel extends JPanel {
         Timer refresh = new Timer(500, e -> reload());
         refresh.setRepeats(true);
         refresh.start();
+
+        // Enrichment listener: when the async API lookup completes,
+        // force a table repaint so the new Reg/Type/Operator values
+        // appear without waiting for the next 500 ms tick.
+        if (enrichment != null) {
+            enrichment.addListener(e -> SwingUtilities.invokeLater(table::repaint));
+        }
+
         reload();
     }
 
@@ -161,22 +185,29 @@ public final class TracksPanel extends JPanel {
     private static final class Model extends AbstractTableModel {
         // Column layout is hand-kept in sync between COLS, TYPES, and
         // the switch in getValueAt. Add a column: update ALL three.
-        // 2026-07-30 13:10 UTC: added Country, Category, Squawk, V/S
-        // between Callsign and Lat. Order chosen so the identity
-        // group (ICAO/Callsign/Country/Category/Squawk) sits together
-        // on the left, then geometry (Lat/Lon), then altitude/motion.
+        // 2026-07-30 13:10 UTC: added Country, Category, Squawk, V/S.
+        // 2026-07-30 14:xx UTC: added Reg, Type, Operator (enrichment
+        // resolver output). Enrichment columns sit right after Country
+        // so identity + registration cluster together visually.
         private static final String[] COLS = {
-                "ICAO", "Callsign", "Country", "Category", "Squawk",
+                "ICAO", "Callsign", "Country", "Reg", "Type", "Operator",
+                "Category", "Squawk",
                 "Lat", "Lon", "Alt (ft)", "V/S (fpm)",
                 "Speed (kt)", "Track", "Age (s)"
         };
         private static final Class<?>[] TYPES = {
-                String.class, String.class, String.class, String.class, String.class,
+                String.class, String.class, String.class, String.class, String.class, String.class,
+                String.class, String.class,
                 Double.class, Double.class, String.class, Integer.class,
                 Integer.class, Integer.class, Long.class
         };
 
+        private final EnrichmentResolver enrichment;
         private List<AdsbTrack> rows = new ArrayList<>();
+
+        Model(EnrichmentResolver enrichment) {
+            this.enrichment = enrichment;
+        }
 
         void setRows(List<AdsbTrack> r) {
             this.rows = r;
@@ -195,6 +226,14 @@ public final class TracksPanel extends JPanel {
         @Override
         public Object getValueAt(int r, int c) {
             AdsbTrack t = rows.get(r);
+            // Enrichment lookup is cheap-ish (cache hit in the common
+            // case, spawns async API lookup on cache miss). Doing it
+            // per-cell keeps the model dumb; caching one lookup per
+            // row per render pass would be a minor optimisation but
+            // not needed at the expected table size.
+            Enrichment e = (enrichment == null)
+                    ? null
+                    : enrichment.lookup(t.icaoHex()).orElse(null);
             switch (c) {
                 case 0: return t.icaoHex();
                 case 1:
@@ -206,24 +245,27 @@ public final class TracksPanel extends JPanel {
                     // the ICAO24 falls in an unallocated / reserved
                     // range -- render as empty cell.
                     return IcaoCountryRegistry.countryFor(t.icaoHex());
-                case 3:
+                case 3: return (e != null) ? e.registration() : null;
+                case 4: return (e != null) ? e.typeCode()     : null;
+                case 5: return (e != null) ? e.operator()     : null;
+                case 6:
                     // Emitter category as a human label. Null before
                     // the first TC 1-4 identification message arrives.
                     return EmitterCategoryLabel.labelFor(t.emitterCategory());
-                case 4:
+                case 7:
                     // Squawk code (Mode-A). Empty when not yet seen.
                     return (t.squawk() != null && !t.squawk().isBlank())
                             ? t.squawk().trim() : "";
-                case 5:
+                case 8:
                     // Lat as Double so the JTable's default sort is numeric,
                     // not lexicographic. Rounded to 4 decimal places -- narrow
                     // column while preserving ~11 m at the equator.
                     return t.hasPosition()
                             ? Double.valueOf(round4(t.latitude())) : null;
-                case 6:
+                case 9:
                     return t.hasPosition()
                             ? Double.valueOf(round4(t.longitude())) : null;
-                case 7:
+                case 10:
                     // Altitude: prepend "GND" when the aircraft self-
                     // reports on-ground (TC 5-8 surface position); makes
                     // taxiing traffic obvious in a scan. Column stays
@@ -237,18 +279,18 @@ public final class TracksPanel extends JPanel {
                     }
                     return (t.preferredAltFt() != Integer.MIN_VALUE)
                             ? Integer.toString(t.preferredAltFt()) : null;
-                case 8:
+                case 11:
                     // Vertical speed (fpm). Positive = climb, negative =
                     // descent, 0 = level. Empty before any TC 19 frame.
                     return (t.verticalRateFpm() != Integer.MIN_VALUE)
                             ? Integer.valueOf(t.verticalRateFpm()) : null;
-                case 9:
+                case 12:
                     return Double.isNaN(t.groundSpeedKts())
                             ? null : Integer.valueOf((int) Math.round(t.groundSpeedKts()));
-                case 10:
+                case 13:
                     return Double.isNaN(t.trackDeg())
                             ? null : Integer.valueOf((int) Math.round(t.trackDeg()));
-                case 11:
+                case 14:
                     return Long.valueOf(
                             Duration.between(t.lastSeen(), Instant.now()).getSeconds());
                 default: return null;

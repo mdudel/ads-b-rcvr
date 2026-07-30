@@ -2,18 +2,29 @@ package com.adsb.ui;
 
 import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
+import com.adsb.enrichment.EnrichmentResolver;
 
 import javax.swing.BorderFactory;
+import javax.swing.JButton;
 import javax.swing.JComboBox;
+import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSlider;
 import javax.swing.JSpinner;
+import javax.swing.JTextField;
 import javax.swing.SpinnerNumberModel;
+import javax.swing.SwingWorker;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.io.File;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.List;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * Settings dock: exposes the knobs the CLI used to own (CoT
@@ -39,9 +50,8 @@ public final class SettingsPanel extends JPanel {
     private final JSlider brightnessSlider;
 
     /**
-     * Legacy 6-arg ctor: brightness starts at 1.0 (fully bright).
-     * Defers to the 7-arg primary ctor. Kept so headless tests + any
-     * pre-persistence caller stay green.
+     * Legacy 6-arg ctor: brightness starts at 1.0 (fully bright),
+     * enrichment row is hidden. Defers to the primary ctor.
      */
     public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
                          IcaoAircraftClassifier.Category    initialCat,
@@ -52,12 +62,29 @@ public final class SettingsPanel extends JPanel {
                 onChange, onBrightnessChanged, 1.0f);
     }
 
+    /**
+     * Legacy 7-arg ctor: no enrichment row.
+     */
     public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
                          IcaoAircraftClassifier.Category    initialCat,
                          int initialStaleAir, int initialStaleGround,
                          SettingsListener onChange,
                          java.util.function.Consumer<Float> onBrightnessChanged,
                          float initialBrightness) {
+        this(initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                onChange, onBrightnessChanged, initialBrightness,
+                null, () -> null, s -> {});
+    }
+
+    public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
+                         IcaoAircraftClassifier.Category    initialCat,
+                         int initialStaleAir, int initialStaleGround,
+                         SettingsListener onChange,
+                         java.util.function.Consumer<Float> onBrightnessChanged,
+                         float initialBrightness,
+                         EnrichmentResolver enrichment,
+                         Supplier<String> enrichmentDirRef,
+                         Consumer<String> enrichmentDirSetter) {
         super(new GridBagLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
@@ -103,6 +130,88 @@ public final class SettingsPanel extends JPanel {
         gc.gridx = 0; gc.gridy = y; add(new JLabel("Map brightness:"),   gc);
         gc.gridx = 1;                add(brightnessSlider,                gc);
         y++;
+
+        // Enrichment section (Marty 2026-07-30 14:05 UTC): local CSV dir
+        // + Browse + Reload + Download OpenSky bundle. Only rendered when
+        // an EnrichmentResolver was passed in.
+        if (enrichment != null) {
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2;
+            add(new JLabel("─ Aircraft metadata ─"), gc);
+            gc.gridwidth = 1;
+            y++;
+
+            JTextField dirField = new JTextField(
+                    enrichmentDirRef.get() == null ? "" : enrichmentDirRef.get(), 24);
+            dirField.setToolTipText("Directory containing OpenSky-format aircraft-database *.csv files");
+            JButton browseBtn = new JButton("Browse\u2026");
+            browseBtn.setFocusable(false);
+            browseBtn.addActionListener(e -> {
+                JFileChooser fc = new JFileChooser();
+                fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+                String cur = dirField.getText();
+                if (cur != null && !cur.isBlank()) {
+                    File f = new File(cur);
+                    if (f.isDirectory()) fc.setCurrentDirectory(f);
+                }
+                int rc = fc.showOpenDialog(this);
+                if (rc == JFileChooser.APPROVE_OPTION) {
+                    Path chosen = fc.getSelectedFile().toPath();
+                    dirField.setText(chosen.toString());
+                    enrichmentDirSetter.accept(chosen.toString());
+                }
+            });
+
+            JButton reloadBtn = new JButton("Reload");
+            reloadBtn.setFocusable(false);
+            reloadBtn.setToolTipText("Re-parse every *.csv in the local dir");
+            JLabel statusLbl = new JLabel(enrichment.statusLine());
+            reloadBtn.addActionListener(e -> {
+                if (enrichment.localDir() != null) enrichment.localDir().reload();
+                if (enrichment.bundle()   != null) enrichment.bundle().reload();
+                statusLbl.setText(enrichment.statusLine());
+            });
+
+            JButton downloadBtn = new JButton("Download bundle");
+            downloadBtn.setFocusable(false);
+            downloadBtn.setToolTipText("Fetch the current OpenSky aircraft-database snapshot");
+            downloadBtn.addActionListener(e -> {
+                downloadBtn.setEnabled(false);
+                downloadBtn.setText("Downloading\u2026");
+                new SwingWorker<Boolean, Void>() {
+                    @Override protected Boolean doInBackground() {
+                        Path bundleDir = Paths.get(
+                                System.getProperty("user.home"),
+                                ".adsb-rcvr", "aircraft-db");
+                        return enrichment.downloadBundle(bundleDir, List.of());
+                    }
+                    @Override protected void done() {
+                        try {
+                            boolean ok = get();
+                            downloadBtn.setText(ok ? "Download bundle" : "Download FAILED");
+                            statusLbl.setText(enrichment.statusLine());
+                        } catch (Exception ex) {
+                            downloadBtn.setText("Download FAILED");
+                        } finally {
+                            downloadBtn.setEnabled(true);
+                        }
+                    }
+                }.execute();
+            });
+
+            gc.gridx = 0; gc.gridy = y; add(new JLabel("Local dir:"), gc);
+            gc.gridx = 1;                add(dirField,                gc);
+            y++;
+            JPanel btnRow = new JPanel();
+            btnRow.add(browseBtn);
+            btnRow.add(reloadBtn);
+            btnRow.add(downloadBtn);
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2; add(btnRow, gc);
+            gc.gridwidth = 1;
+            y++;
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2; add(statusLbl, gc);
+            gc.gridwidth = 1;
+            y++;
+        }
 
         // Fill remaining vertical space so widgets sit at the top.
         gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2; gc.weighty = 1.0;

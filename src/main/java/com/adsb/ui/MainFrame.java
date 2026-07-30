@@ -3,6 +3,7 @@ package com.adsb.ui;
 import com.adsb.core.AdsbReceiver;
 import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
+import com.adsb.enrichment.EnrichmentResolver;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.ui.model.ConnectorAttacher;
 import com.adsb.ui.model.ConnectorStore;
@@ -131,6 +132,11 @@ public final class MainFrame extends JFrame {
                 1.0f, b -> {});
     }
 
+    /**
+     * Legacy 16-arg ctor: no enrichment resolver. Delegates to the
+     * 19-arg primary with a null resolver -- enrichment columns stay
+     * empty and the Settings enrichment row is hidden.
+     */
     public MainFrame(String version,
                      AircraftStateStore store,
                      ConnectorStore connectorStore,
@@ -146,6 +152,32 @@ public final class MainFrame extends JFrame {
                      java.util.function.Consumer<String> lastCertDirSetter,
                      float initialMapBrightness,
                      Consumer<Float> onMapBrightnessChanged) {
+        this(version, store, connectorStore, attacher, liveBuilder,
+                initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                initialTheme, onThemeChanged, receiver,
+                lastCertDirRef, lastCertDirSetter,
+                initialMapBrightness, onMapBrightnessChanged,
+                null, () -> null, s -> {});
+    }
+
+    public MainFrame(String version,
+                     AircraftStateStore store,
+                     ConnectorStore connectorStore,
+                     ConnectorAttacher attacher,
+                     AtomicReference<CoTBuilder> liveBuilder,
+                     IcaoAircraftClassifier.Affiliation initialAffil,
+                     IcaoAircraftClassifier.Category    initialCat,
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver,
+                     java.util.function.Supplier<String> lastCertDirRef,
+                     java.util.function.Consumer<String> lastCertDirSetter,
+                     float initialMapBrightness,
+                     Consumer<Float> onMapBrightnessChanged,
+                     EnrichmentResolver enrichment,
+                     java.util.function.Supplier<String> enrichmentDirRef,
+                     java.util.function.Consumer<String> enrichmentDirSetter) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -175,7 +207,7 @@ public final class MainFrame extends JFrame {
         // Apply persisted brightness BEFORE the panel first paints so
         // the operator doesn't see a full-bright flash on start.
         mapPanel.setBrightness(initialMapBrightness);
-        this.tracksPanel      = new TracksPanel(store, mapPanel::centerOn);
+        this.tracksPanel      = new TracksPanel(store, enrichment, mapPanel::centerOn);
         this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher,
                 lastCertDirRef, lastCertDirSetter);
         // Compose the brightness callback: update the live MapPanel AND
@@ -191,7 +223,10 @@ public final class MainFrame extends JFrame {
                     liveBuilder.set(new CoTBuilder(new IcaoAircraftClassifier(aff, cat), sa, sg));
                 },
                 brightnessSink,
-                initialMapBrightness);
+                initialMapBrightness,
+                enrichment,
+                enrichmentDirRef,
+                enrichmentDirSetter);
         this.aboutPanel       = new AboutPanel(version);
 
         this.sideDock = new SideDock(mapPanel);
