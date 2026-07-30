@@ -51,12 +51,22 @@ public final class TracksPanel extends JPanel {
      * stay empty.
      */
     public TracksPanel(AircraftStateStore store, Consumer<AdsbTrack> onRowSelected) {
-        this(store, null, onRowSelected);
+        this(store, null, onRowSelected, null);
+    }
+
+    /**
+     * Legacy 3-arg ctor: no double-click handler wired.
+     */
+    public TracksPanel(AircraftStateStore store,
+                       EnrichmentResolver enrichment,
+                       Consumer<AdsbTrack> onRowSelected) {
+        this(store, enrichment, onRowSelected, null);
     }
 
     public TracksPanel(AircraftStateStore store,
                        EnrichmentResolver enrichment,
-                       Consumer<AdsbTrack> onRowSelected) {
+                       Consumer<AdsbTrack> onRowSelected,
+                       Consumer<AdsbTrack> onRowDoubleClicked) {
         super(new BorderLayout());
         this.store = store;
         this.enrichment = enrichment;
@@ -75,6 +85,24 @@ public final class TracksPanel extends JPanel {
             AdsbTrack t = model.rowAt(modelRow);
             if (t != null && onRowSelected != null) onRowSelected.accept(t);
         });
+
+        // Double-click opens the details popup (Marty 2026-07-30 15:01
+        // UTC, issue #15). Single click still centers on the map via
+        // the selection listener above; the two gestures don't conflict
+        // because MouseAdapter#mouseClicked fires with a clickCount
+        // that we check here.
+        if (onRowDoubleClicked != null) {
+            table.addMouseListener(new java.awt.event.MouseAdapter() {
+                @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                    if (e.getClickCount() != 2) return;
+                    int viewRow = table.rowAtPoint(e.getPoint());
+                    if (viewRow < 0) return;
+                    int modelRow = table.convertRowIndexToModel(viewRow);
+                    AdsbTrack t = model.rowAt(modelRow);
+                    if (t != null) onRowDoubleClicked.accept(t);
+                }
+            });
+        }
 
         // Fade + metadata renderer: mirror the map's per-track alpha
         // in the table by blending the row's foreground toward the

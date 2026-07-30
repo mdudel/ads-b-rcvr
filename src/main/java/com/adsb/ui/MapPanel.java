@@ -27,10 +27,13 @@ import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * Map surface + floating nav bezel. Wraps a {@link JXMapViewer} in a
@@ -57,6 +60,16 @@ public final class MapPanel extends JPanel {
     private volatile boolean hasAutoFit;
     private final Timer repaintCoalescer;
     private volatile float mapBrightness = 1.0f;  // 0.0=black, 1.0=normal
+
+    /**
+     * Called when the operator clicks on (or very near) an aircraft
+     * glyph. Null-safe; the click handler no-ops when unset.
+     * Wired by MainFrame to open the {@link TrackDetailsDialog}.
+     */
+    private volatile Consumer<AdsbTrack> onTrackClicked;
+
+    /** Pixel radius for click hit-testing. Generous so touch-lite operators still hit. */
+    private static final int CLICK_HIT_RADIUS_PX = 16;
 
     public MapPanel(AircraftStateStore store) {
         super(new BorderLayout());
@@ -88,6 +101,21 @@ public final class MapPanel extends JPanel {
         var pan = new PanMouseInputListener(map);
         map.addMouseListener(pan);
         map.addMouseMotionListener(pan);
+        // Track-click hit test runs BEFORE CenterMapListener so a
+        // click on an aircraft glyph opens its details popup rather
+        // than re-centering the map. Miss falls through to the
+        // centre-listener normally. (Marty 2026-07-30 15:01 UTC #15)
+        map.addMouseListener(new MouseAdapter() {
+            @Override public void mouseClicked(MouseEvent e) {
+                if (e.getButton() != MouseEvent.BUTTON1) return;
+                AdsbTrack hit = findTrackAt(e.getX(), e.getY());
+                if (hit != null) {
+                    Consumer<AdsbTrack> h = onTrackClicked;
+                    if (h != null) h.accept(hit);
+                    e.consume();
+                }
+            }
+        });
         map.addMouseListener(new CenterMapListener(map));
         map.addMouseWheelListener(new ZoomMouseWheelListenerCursor(map));
 
@@ -156,6 +184,45 @@ public final class MapPanel extends JPanel {
             }
         });
         return layered;
+    }
+
+    /**
+     * Register the callback invoked when the operator clicks on an
+     * aircraft glyph. Wired by MainFrame to open the details popup.
+     * Nullable (no-op if unset).
+     */
+    public void setOnTrackClicked(Consumer<AdsbTrack> handler) {
+        this.onTrackClicked = handler;
+    }
+
+    /**
+     * Pixel-space nearest-track hit test. Iterates positioned tracks,
+     * projects to viewport pixels, keeps the closest whose pixel
+     * distance is within {@link #CLICK_HIT_RADIUS_PX}. Skips tracks
+     * that have faded out (alpha <= 0) so the operator can't
+     * accidentally click an aged-out ghost.
+     *
+     * @return the hit track, or null on a miss (open water click)
+     */
+    private AdsbTrack findTrackAt(int mouseX, int mouseY) {
+        Rectangle vp = map.getViewportBounds();
+        java.time.Instant now = java.time.Instant.now();
+        AdsbTrack best = null;
+        double bestDist2 = (double) CLICK_HIT_RADIUS_PX * CLICK_HIT_RADIUS_PX;
+        for (AdsbTrack t : store.allSnapshots()) {
+            if (!t.hasPosition()) continue;
+            if (AircraftStateStore.fadeAlphaFor(t, now) <= 0.0f) continue;
+            Point2D p = map.getTileFactory().geoToPixel(
+                    new GeoPosition(t.latitude(), t.longitude()), map.getZoom());
+            double dx = (p.getX() - vp.x) - mouseX;
+            double dy = (p.getY() - vp.y) - mouseY;
+            double d2 = dx * dx + dy * dy;
+            if (d2 <= bestDist2) {
+                bestDist2 = d2;
+                best = t;
+            }
+        }
+        return best;
     }
 
     /** Centre the map on the given aircraft snapshot. Used by the table row-click. */

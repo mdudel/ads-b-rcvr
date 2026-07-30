@@ -207,7 +207,16 @@ public final class MainFrame extends JFrame {
         // Apply persisted brightness BEFORE the panel first paints so
         // the operator doesn't see a full-bright flash on start.
         mapPanel.setBrightness(initialMapBrightness);
-        this.tracksPanel      = new TracksPanel(store, enrichment, mapPanel::centerOn);
+        // Details-popup opener: same handler for map-click and
+        // tracks-table double-click so both gestures produce the
+        // same result (Marty 2026-07-30 15:01 UTC, issue #15).
+        final EnrichmentResolver enrichmentForPopup = enrichment;
+        final java.util.function.Consumer<com.adsb.model.AdsbTrack> openDetails =
+                t -> TrackDetailsDialog.showFor(this, t.icaoHex(), store, enrichmentForPopup);
+
+        this.tracksPanel      = new TracksPanel(store, enrichment,
+                mapPanel::centerOn, openDetails);
+        mapPanel.setOnTrackClicked(openDetails);
         this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher,
                 lastCertDirRef, lastCertDirSetter);
         // Compose the brightness callback: update the live MapPanel AND
