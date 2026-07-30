@@ -2,6 +2,8 @@ package com.adsb.ui;
 
 import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
+import com.adsb.model.EmitterCategoryLabel;
+import com.adsb.model.IcaoCountryRegistry;
 
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -58,10 +60,12 @@ public final class TracksPanel extends JPanel {
             if (t != null && onRowSelected != null) onRowSelected.accept(t);
         });
 
-        // Fade renderer: mirror the map's per-track alpha in the table
-        // by blending the row's foreground toward the table background.
-        // Rows past REMOVE_AT are filtered in reload() so they never
-        // reach the renderer. (Marty 2026-07-30 12:47 UTC.)
+        // Fade + metadata renderer: mirror the map's per-track alpha
+        // in the table by blending the row's foreground toward the
+        // table background, AND highlight emergency squawks in red
+        // bold. Rows past REMOVE_AT are filtered in reload() so they
+        // never reach the renderer. (Marty 2026-07-30 12:47 UTC fade;
+        // 13:10 UTC metadata columns.)
         DefaultTableCellRenderer fadeRenderer = new DefaultTableCellRenderer() {
             @Override
             public Component getTableCellRendererComponent(JTable tbl, Object value,
@@ -70,14 +74,35 @@ public final class TracksPanel extends JPanel {
                         tbl, value, isSelected, hasFocus, row, column);
                 int modelRow = tbl.convertRowIndexToModel(row);
                 AdsbTrack t = model.rowAt(modelRow);
-                if (t != null && !isSelected && c instanceof JLabel lbl) {
-                    float alpha = AircraftStateStore.fadeAlphaFor(t, Instant.now());
-                    if (alpha < 1.0f) {
-                        Color fg = tbl.getForeground();
-                        Color bg = tbl.getBackground();
-                        lbl.setForeground(blend(fg, bg, alpha));
-                    } else {
-                        lbl.setForeground(tbl.getForeground());
+                if (c instanceof JLabel lbl) {
+                    // Reset to defaults so a previous emergency-row's
+                    // bold/red styling doesn't leak into a normal row
+                    // reused by the same renderer instance.
+                    lbl.setFont(tbl.getFont());
+                    Color baseFg = isSelected ? tbl.getSelectionForeground() : tbl.getForeground();
+                    lbl.setForeground(baseFg);
+
+                    if (t != null) {
+                        // Emergency: bold red foreground for the whole
+                        // row so a distressed aircraft is unmissable.
+                        // Applies to ALL cells in the row so scanning
+                        // works regardless of which column the eye
+                        // lands on first.
+                        if (t.isEmergency() && !isSelected) {
+                            lbl.setForeground(new Color(0xC0, 0x39, 0x2B));
+                            lbl.setFont(tbl.getFont().deriveFont(java.awt.Font.BOLD));
+                        }
+
+                        // Fade: blend row fg toward table bg at
+                        // (1 - alpha). Skip on selection so a
+                        // clicked faded row stays readable.
+                        if (!isSelected) {
+                            float alpha = AircraftStateStore.fadeAlphaFor(t, Instant.now());
+                            if (alpha < 1.0f) {
+                                Color bg = tbl.getBackground();
+                                lbl.setForeground(blend(lbl.getForeground(), bg, alpha));
+                            }
+                        }
                     }
                 }
                 return c;
@@ -135,14 +160,20 @@ public final class TracksPanel extends JPanel {
 
     private static final class Model extends AbstractTableModel {
         // Column layout is hand-kept in sync between COLS, TYPES, and
-        // the switch in getValueAt. Add a column: update all three.
+        // the switch in getValueAt. Add a column: update ALL three.
+        // 2026-07-30 13:10 UTC: added Country, Category, Squawk, V/S
+        // between Callsign and Lat. Order chosen so the identity
+        // group (ICAO/Callsign/Country/Category/Squawk) sits together
+        // on the left, then geometry (Lat/Lon), then altitude/motion.
         private static final String[] COLS = {
-                "ICAO", "Callsign", "Lat", "Lon",
-                "Alt (ft)", "Speed (kt)", "Track", "Age (s)"
+                "ICAO", "Callsign", "Country", "Category", "Squawk",
+                "Lat", "Lon", "Alt (ft)", "V/S (fpm)",
+                "Speed (kt)", "Track", "Age (s)"
         };
         private static final Class<?>[] TYPES = {
-                String.class, String.class, Double.class, Double.class,
-                Integer.class, Integer.class, Integer.class, Long.class
+                String.class, String.class, String.class, String.class, String.class,
+                Double.class, Double.class, String.class, Integer.class,
+                Integer.class, Integer.class, Long.class
         };
 
         private List<AdsbTrack> rows = new ArrayList<>();
@@ -170,24 +201,54 @@ public final class TracksPanel extends JPanel {
                     return (t.callsign() != null && !t.callsign().isBlank())
                             ? t.callsign().trim() : "";
                 case 2:
+                    // Country of registration (pure algorithmic lookup
+                    // via IcaoCountryRegistry; no network). Null when
+                    // the ICAO24 falls in an unallocated / reserved
+                    // range -- render as empty cell.
+                    return IcaoCountryRegistry.countryFor(t.icaoHex());
+                case 3:
+                    // Emitter category as a human label. Null before
+                    // the first TC 1-4 identification message arrives.
+                    return EmitterCategoryLabel.labelFor(t.emitterCategory());
+                case 4:
+                    // Squawk code (Mode-A). Empty when not yet seen.
+                    return (t.squawk() != null && !t.squawk().isBlank())
+                            ? t.squawk().trim() : "";
+                case 5:
                     // Lat as Double so the JTable's default sort is numeric,
                     // not lexicographic. Rounded to 4 decimal places -- narrow
                     // column while preserving ~11 m at the equator.
                     return t.hasPosition()
                             ? Double.valueOf(round4(t.latitude())) : null;
-                case 3:
+                case 6:
                     return t.hasPosition()
                             ? Double.valueOf(round4(t.longitude())) : null;
-                case 4:
+                case 7:
+                    // Altitude: prepend "GND" when the aircraft self-
+                    // reports on-ground (TC 5-8 surface position); makes
+                    // taxiing traffic obvious in a scan. Column stays
+                    // String-typed so we can carry the marker; sort will
+                    // be lexicographic but that's acceptable given the
+                    // typical value range.
+                    if (t.onGround()) {
+                        int alt = t.preferredAltFt();
+                        return alt != Integer.MIN_VALUE
+                                ? ("GND " + alt) : "GND";
+                    }
                     return (t.preferredAltFt() != Integer.MIN_VALUE)
-                            ? Integer.valueOf(t.preferredAltFt()) : null;
-                case 5:
+                            ? Integer.toString(t.preferredAltFt()) : null;
+                case 8:
+                    // Vertical speed (fpm). Positive = climb, negative =
+                    // descent, 0 = level. Empty before any TC 19 frame.
+                    return (t.verticalRateFpm() != Integer.MIN_VALUE)
+                            ? Integer.valueOf(t.verticalRateFpm()) : null;
+                case 9:
                     return Double.isNaN(t.groundSpeedKts())
                             ? null : Integer.valueOf((int) Math.round(t.groundSpeedKts()));
-                case 6:
+                case 10:
                     return Double.isNaN(t.trackDeg())
                             ? null : Integer.valueOf((int) Math.round(t.trackDeg()));
-                case 7:
+                case 11:
                     return Long.valueOf(
                             Duration.between(t.lastSeen(), Instant.now()).getSeconds());
                 default: return null;

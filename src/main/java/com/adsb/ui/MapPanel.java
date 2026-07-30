@@ -292,6 +292,17 @@ public final class MapPanel extends JPanel {
                     double heading = Double.isNaN(t.trackDeg()) ? 0.0 : t.trackDeg();
                     drawAircraftGlyph(g, x, y, heading, c);
 
+                    // Emergency ring: draw a red circle around distressed
+                    // aircraft (squawk 7500/7600/7700 or ADS-B emergency
+                    // status > 0) so operators can find them at a glance.
+                    if (t.isEmergency()) {
+                        java.awt.Stroke oldStroke = g.getStroke();
+                        g.setStroke(new java.awt.BasicStroke(2.0f));
+                        g.setColor(new Color(0xC0, 0x39, 0x2B));
+                        g.drawOval(x - 11, y - 11, 22, 22);
+                        g.setStroke(oldStroke);
+                    }
+
                     String label = t.callsign() != null && !t.callsign().isBlank()
                             ? t.callsign().trim()
                             : t.icaoHex();
