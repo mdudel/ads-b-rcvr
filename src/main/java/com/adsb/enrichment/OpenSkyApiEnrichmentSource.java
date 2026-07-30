@@ -9,6 +9,8 @@ import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -62,11 +64,32 @@ public final class OpenSkyApiEnrichmentSource implements EnrichmentSource {
     private static final Duration CONNECT_TIMEOUT     = Duration.ofSeconds(5);
     private static final Duration RESPONSE_TIMEOUT    = Duration.ofSeconds(10);
 
+    /**
+     * How many consecutive 5xx (server-side) failures before we give
+     * up on the endpoint for the rest of the session. Individual 5xx
+     * responses are transient and worth retrying via the async worker;
+     * a run of them means the service is genuinely down and further
+     * polling is rude.
+     */
+    static final int CONSECUTIVE_5XX_TO_DISABLE = 5;
+
     private final HttpClient httpClient;
     private final String baseUrl;
     private final Semaphore inFlight = new Semaphore(1, /*fair*/ true);
     private final long minIntervalNanos;
     private final AtomicLong lastRequestNanos = new AtomicLong(0);
+
+    /**
+     * Session-scoped circuit breaker (Marty 2026-07-30 15:39 UTC):
+     * once tripped by an HTTP 410 Gone ("this endpoint is permanently
+     * retired") or by {@link #CONSECUTIVE_5XX_TO_DISABLE} back-to-back
+     * server errors, {@link #lookup} short-circuits to
+     * {@link Optional#empty()} without any further network I/O for
+     * the rest of the JVM's life. Only relaunching resets it.
+     */
+    private final AtomicBoolean disabled = new AtomicBoolean(false);
+    private volatile String disabledReason;
+    private final AtomicInteger consecutive5xx = new AtomicInteger(0);
 
     public OpenSkyApiEnrichmentSource() {
         this(DEFAULT_BASE_URL, DEFAULT_MIN_INTERVAL);
@@ -85,6 +108,9 @@ public final class OpenSkyApiEnrichmentSource implements EnrichmentSource {
     @Override
     public Optional<Enrichment> lookup(String icaoHex) {
         if (icaoHex == null || icaoHex.isBlank()) return Optional.empty();
+        // Circuit breaker: once the endpoint has been declared dead
+        // (410 Gone) or degraded (5xx run), stop pestering it.
+        if (disabled.get()) return Optional.empty();
         String key = icaoHex.trim().toLowerCase();
         if (key.length() > 6) return Optional.empty();
 
@@ -130,16 +156,37 @@ public final class OpenSkyApiEnrichmentSource implements EnrichmentSource {
             int sc = resp.statusCode();
             if (sc == 404) {
                 // Common case: aircraft not in OpenSky DB. Don't log.
+                consecutive5xx.set(0);
+                return Optional.empty();
+            }
+            if (sc == 410) {
+                // Endpoint permanently gone. Trip the breaker so we
+                // don't queue any further requests this session.
+                tripBreaker("HTTP 410 Gone from " + baseUrl
+                        + " -- endpoint retired");
                 return Optional.empty();
             }
             if (sc == 429) {
                 System.err.printf("[enrichment/opensky] rate-limited on %s%n", key);
+                consecutive5xx.set(0);
+                return Optional.empty();
+            }
+            if (sc / 100 == 5) {
+                int n = consecutive5xx.incrementAndGet();
+                System.err.printf("[enrichment/opensky] HTTP %d for %s (%d/%d before backoff)%n",
+                        sc, key, n, CONSECUTIVE_5XX_TO_DISABLE);
+                if (n >= CONSECUTIVE_5XX_TO_DISABLE) {
+                    tripBreaker("HTTP " + sc + " x" + n
+                            + " -- service degraded, backing off for the session");
+                }
                 return Optional.empty();
             }
             if (sc / 100 != 2) {
                 System.err.printf("[enrichment/opensky] HTTP %d for %s%n", sc, key);
+                consecutive5xx.set(0);
                 return Optional.empty();
             }
+            consecutive5xx.set(0);
             return Optional.of(parseJson(icaoHex.toUpperCase(), resp.body()));
         } finally {
             inFlight.release();
@@ -148,7 +195,38 @@ public final class OpenSkyApiEnrichmentSource implements EnrichmentSource {
 
     @Override
     public String name() {
-        return "opensky-api";
+        return disabled.get()
+                ? "opensky-api (disabled: " + disabledReason + ")"
+                : "opensky-api";
+    }
+
+    /** @return true when the circuit breaker has tripped. */
+    public boolean isDisabled() { return disabled.get(); }
+
+    /** @return reason string when disabled, or null when still active. */
+    public String disabledReason() { return disabledReason; }
+
+    /**
+     * Trip the circuit breaker. Idempotent: first tripper wins the
+     * reason; subsequent trips are no-ops. Package-private so a
+     * future menu action ("Retry OpenSky API") could clear it or a
+     * test could verify tripping.
+     */
+    void tripBreaker(String reason) {
+        if (disabled.compareAndSet(false, true)) {
+            this.disabledReason = reason;
+            System.err.println("[enrichment/opensky] disabling API for this session: " + reason);
+        }
+    }
+
+    /**
+     * Reset the circuit breaker. Not called automatically; exposed
+     * for a possible menu action / test.
+     */
+    public void resetBreaker() {
+        disabled.set(false);
+        disabledReason = null;
+        consecutive5xx.set(0);
     }
 
     /**

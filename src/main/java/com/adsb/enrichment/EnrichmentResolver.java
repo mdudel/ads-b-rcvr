@@ -136,7 +136,11 @@ public final class EnrichmentResolver {
         }
 
         // 4) API (async, non-blocking)
-        if (api != null && inflight.putIfAbsent(key, Boolean.TRUE) == null) {
+        // Skip the async spawn entirely when the API source has
+        // tripped its circuit breaker -- otherwise we'd queue a
+        // worker task that immediately no-ops, wasting the slot.
+        if (api != null && !apiIsDisabled(api)
+                && inflight.putIfAbsent(key, Boolean.TRUE) == null) {
             worker.submit(() -> {
                 try {
                     Enrichment result = api.lookup(key).orElseGet(() -> Enrichment.empty(key));
@@ -149,6 +153,17 @@ public final class EnrichmentResolver {
             });
         }
         return Optional.empty();
+    }
+
+    /**
+     * Duck-type check for a source-level circuit breaker. Currently
+     * only {@link OpenSkyApiEnrichmentSource} exposes one; other
+     * sources return false. Kept as an instanceof rather than adding
+     * an isDisabled() method to the SPI so the interface stays lean
+     * for third-party sources that don't need the concept.
+     */
+    private static boolean apiIsDisabled(EnrichmentSource src) {
+        return (src instanceof OpenSkyApiEnrichmentSource api) && api.isDisabled();
     }
 
     private static Optional<Enrichment> safeLookup(EnrichmentSource src, String key) {

@@ -91,4 +91,64 @@ public final class OpenSkyApiEnrichmentSourceTest {
         assertNull(e.typeCode());
         assertNull(e.operator());
     }
+
+    // ---- circuit breaker (Marty 2026-07-30 15:39 UTC) ----
+
+    @Test
+    void freshInstanceIsNotDisabled() {
+        OpenSkyApiEnrichmentSource s = new OpenSkyApiEnrichmentSource();
+        assertFalse(s.isDisabled());
+        assertNull(s.disabledReason());
+        assertEquals("opensky-api", s.name());
+    }
+
+    @Test
+    void tripBreakerShortCircuitsLookup() {
+        OpenSkyApiEnrichmentSource s = new OpenSkyApiEnrichmentSource();
+        s.tripBreaker("unit-test trip");
+        assertTrue(s.isDisabled());
+        assertEquals("unit-test trip", s.disabledReason());
+        // lookup() must NOT touch the network (semaphore acquire + HTTP
+        // send would block or fail in the sandbox). Fast return of
+        // Optional.empty() proves the short-circuit fired first.
+        assertTrue(s.lookup("3C6444").isEmpty());
+        assertTrue(s.lookup("400123").isEmpty());
+    }
+
+    @Test
+    void tripBreakerIsIdempotent() {
+        OpenSkyApiEnrichmentSource s = new OpenSkyApiEnrichmentSource();
+        s.tripBreaker("first");
+        s.tripBreaker("second");
+        // First reason wins; second call is a no-op.
+        assertEquals("first", s.disabledReason());
+    }
+
+    @Test
+    void resetBreakerRestoresLiveState() {
+        OpenSkyApiEnrichmentSource s = new OpenSkyApiEnrichmentSource();
+        s.tripBreaker("transient issue");
+        assertTrue(s.isDisabled());
+        s.resetBreaker();
+        assertFalse(s.isDisabled());
+        assertNull(s.disabledReason());
+        assertEquals("opensky-api", s.name());
+    }
+
+    @Test
+    void nameReflectsDisabledStateForStatusLine() {
+        OpenSkyApiEnrichmentSource s = new OpenSkyApiEnrichmentSource();
+        assertEquals("opensky-api", s.name());
+        s.tripBreaker("HTTP 410 Gone from https://... -- endpoint retired");
+        assertTrue(s.name().startsWith("opensky-api (disabled: HTTP 410"));
+    }
+
+    @Test
+    void consecutive5xxThresholdIsPinned() {
+        // If someone tweaks this, tests further up + the Settings-panel
+        // status line will still guard the behaviour, but pin the
+        // number explicitly so a rename can't silently change the
+        // backoff aggressiveness.
+        assertEquals(5, OpenSkyApiEnrichmentSource.CONSECUTIVE_5XX_TO_DISABLE);
+    }
 }
