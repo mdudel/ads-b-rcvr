@@ -102,7 +102,10 @@ public final class MapPanel extends JPanel {
         add(buildMapArea(), BorderLayout.CENTER);
 
         this.repaintCoalescer = new Timer(250, e -> {
-            if (repaintPending) {
+            // Repaint if a listener flagged us OR any track is currently
+            // inside its fade window (need continuous repaints for the
+            // 30s alpha ramp to be smooth).
+            if (repaintPending || anyTrackFading()) {
                 repaintPending = false;
                 map.repaint();
             }
@@ -172,6 +175,25 @@ public final class MapPanel extends JPanel {
         repaintPending = true;
     }
 
+    /**
+     * @return true when at least one track's age is in the fade
+     *         window [FADE_START_MS, REMOVE_AT_MS). Used by the
+     *         repaint coalescer to drive continuous repaints while
+     *         any track is fading, without paying that cost when
+     *         everyone is fresh.
+     */
+    private boolean anyTrackFading() {
+        java.time.Instant now = java.time.Instant.now();
+        for (AdsbTrack t : store.allSnapshots()) {
+            long age = java.time.Duration.between(t.lastSeen(), now).toMillis();
+            if (age >= AircraftStateStore.FADE_START_MS
+                    && age < AircraftStateStore.REMOVE_AT_MS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Re-centre + zoom to roughly encompass currently-positioned tracks. */
     private void fitToTracks() {
         double sumLat = 0, sumLon = 0;
@@ -217,14 +239,34 @@ public final class MapPanel extends JPanel {
                 Color labelColour = javax.swing.UIManager.getColor("Label.foreground");
                 if (labelColour == null) labelColour = Color.BLACK;
 
+                java.time.Instant paintNow = java.time.Instant.now();
+                Composite baseComposite = g.getComposite();
+
                 for (AdsbTrack t : store.allSnapshots()) {
                     if (!t.hasPosition()) continue;
+
+                    // Fade-out: 120s->1.0, 150s->0.0 linearly (Marty
+                    // 2026-07-30 12:47 UTC). At or past REMOVE_AT the
+                    // eviction sweep drops the row shortly; skip painting
+                    // in the meantime so we don't render invisible pixels.
+                    float alpha = AircraftStateStore.fadeAlphaFor(t, paintNow);
+                    if (alpha <= 0.0f) continue;
+
                     Point2D p = viewer.getTileFactory().geoToPixel(
                             new GeoPosition(t.latitude(), t.longitude()),
                             viewer.getZoom());
                     int x = (int) (p.getX() - vp.x);
                     int y = (int) (p.getY() - vp.y);
                     if (x < -20 || y < -20 || x > width + 20 || y > height + 20) continue;
+
+                    // Apply per-track alpha for glyph + trail + label so
+                    // the whole track fades together as one unit.
+                    if (alpha < 1.0f) {
+                        g.setComposite(AlphaComposite.getInstance(
+                                AlphaComposite.SRC_OVER, alpha));
+                    } else {
+                        g.setComposite(baseComposite);
+                    }
 
                     Color c = altitudeColour(t.preferredAltFt());
 
@@ -256,6 +298,7 @@ public final class MapPanel extends JPanel {
                     g.setColor(labelColour);
                     g.drawString(label, x + 8, y - 4);
                 }
+                g.setComposite(baseComposite);
             } finally {
                 g.dispose();
             }

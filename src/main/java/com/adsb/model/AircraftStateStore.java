@@ -46,6 +46,57 @@ public final class AircraftStateStore {
     /** Max trail points to retain per aircraft. ~50 = 5 min at 6s update rate. */
     private static final int MAX_TRAIL_POINTS = 50;
 
+    // ----- fade / expiry constants (Marty 2026-07-30 12:47 UTC) -----
+    /**
+     * Age (ms since last update) at which a track begins fading out on
+     * the UI. Below this age the track paints at full opacity.
+     */
+    public static final long FADE_START_MS    = 120_000L;
+    /**
+     * How long the fade animation lasts. Alpha decays linearly from
+     * 1.0 at FADE_START_MS to 0.0 at FADE_START_MS + FADE_DURATION_MS,
+     * at which point the track is evicted.
+     */
+    public static final long FADE_DURATION_MS =  30_000L;
+    /**
+     * Age (ms since last update) at which a track is removed entirely.
+     * The map painter and tracks table both stop rendering it at this
+     * age; the periodic eviction sweep drops it from the store shortly
+     * after.
+     */
+    public static final long REMOVE_AT_MS     = FADE_START_MS + FADE_DURATION_MS;
+
+    /**
+     * Compute the paint alpha [0.0, 1.0] for a track given its age in
+     * milliseconds since last update. Pure function so it can be unit-
+     * tested without a live store.
+     *
+     * <ul>
+     *   <li>age &lt; {@value #FADE_START_MS} ms -&gt; 1.0 (full opacity)</li>
+     *   <li>{@value #FADE_START_MS} ms &le; age &lt; {@link #REMOVE_AT_MS}
+     *       ms -&gt; linear ramp from 1.0 to 0.0</li>
+     *   <li>age &ge; {@link #REMOVE_AT_MS} ms -&gt; 0.0 (invisible; will
+     *       be evicted)</li>
+     * </ul>
+     */
+    public static float fadeAlphaForAgeMs(long ageMs) {
+        if (ageMs < FADE_START_MS) return 1.0f;
+        if (ageMs >= REMOVE_AT_MS) return 0.0f;
+        long fadeElapsed = ageMs - FADE_START_MS;
+        return 1.0f - ((float) fadeElapsed / (float) FADE_DURATION_MS);
+    }
+
+    /**
+     * Convenience: compute the paint alpha for a track relative to a
+     * reference instant (typically {@code Instant.now()} at the top of
+     * a paint pass).
+     */
+    public static float fadeAlphaFor(AdsbTrack t, Instant now) {
+        if (t == null || t.lastSeen() == null) return 1.0f;
+        long ageMs = Duration.between(t.lastSeen(), now).toMillis();
+        return fadeAlphaForAgeMs(ageMs);
+    }
+
     /** Snapshot listeners. Copy-on-write so add/remove is safe under concurrent publish. */
     private final List<Consumer<AdsbTrack>> listeners = new CopyOnWriteArrayList<>();
 

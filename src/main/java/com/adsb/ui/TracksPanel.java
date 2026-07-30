@@ -3,14 +3,18 @@ package com.adsb.ui;
 import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
 
+import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.JTable;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableRowSorter;
 import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -54,6 +58,39 @@ public final class TracksPanel extends JPanel {
             if (t != null && onRowSelected != null) onRowSelected.accept(t);
         });
 
+        // Fade renderer: mirror the map's per-track alpha in the table
+        // by blending the row's foreground toward the table background.
+        // Rows past REMOVE_AT are filtered in reload() so they never
+        // reach the renderer. (Marty 2026-07-30 12:47 UTC.)
+        DefaultTableCellRenderer fadeRenderer = new DefaultTableCellRenderer() {
+            @Override
+            public Component getTableCellRendererComponent(JTable tbl, Object value,
+                    boolean isSelected, boolean hasFocus, int row, int column) {
+                Component c = super.getTableCellRendererComponent(
+                        tbl, value, isSelected, hasFocus, row, column);
+                int modelRow = tbl.convertRowIndexToModel(row);
+                AdsbTrack t = model.rowAt(modelRow);
+                if (t != null && !isSelected && c instanceof JLabel lbl) {
+                    float alpha = AircraftStateStore.fadeAlphaFor(t, Instant.now());
+                    if (alpha < 1.0f) {
+                        Color fg = tbl.getForeground();
+                        Color bg = tbl.getBackground();
+                        lbl.setForeground(blend(fg, bg, alpha));
+                    } else {
+                        lbl.setForeground(tbl.getForeground());
+                    }
+                }
+                return c;
+            }
+        };
+        // Install the fade renderer for every column type currently in
+        // the model. New column types must be added here too.
+        table.setDefaultRenderer(Object.class,  fadeRenderer);
+        table.setDefaultRenderer(String.class,  fadeRenderer);
+        table.setDefaultRenderer(Double.class,  fadeRenderer);
+        table.setDefaultRenderer(Integer.class, fadeRenderer);
+        table.setDefaultRenderer(Long.class,    fadeRenderer);
+
         add(new JScrollPane(table), BorderLayout.CENTER);
 
         // 500 ms refresh: rebuilds the row list from the store snapshot.
@@ -64,8 +101,32 @@ public final class TracksPanel extends JPanel {
     }
 
     private void reload() {
-        List<AdsbTrack> snap = store.allSnapshots();
+        // Filter out rows past the eviction threshold so the table
+        // doesn't briefly show a fully-faded ghost row before the
+        // periodic eviction sweep drops it from the store.
+        Instant now = Instant.now();
+        List<AdsbTrack> snap = new ArrayList<>();
+        for (AdsbTrack t : store.allSnapshots()) {
+            long age = Duration.between(t.lastSeen(), now).toMillis();
+            if (age < AircraftStateStore.REMOVE_AT_MS) snap.add(t);
+        }
         SwingUtilities.invokeLater(() -> model.setRows(snap));
+    }
+
+    /**
+     * Blend {@code fg} toward {@code bg} by (1 - alpha). alpha=1 returns
+     * fg unchanged; alpha=0 returns bg. Used to fade table row text
+     * toward the table background as tracks age out.
+     */
+    private static Color blend(Color fg, Color bg, float alpha) {
+        float inv = 1.0f - alpha;
+        int r = (int) (fg.getRed()   * alpha + bg.getRed()   * inv);
+        int g = (int) (fg.getGreen() * alpha + bg.getGreen() * inv);
+        int b = (int) (fg.getBlue()  * alpha + bg.getBlue()  * inv);
+        return new Color(
+                Math.max(0, Math.min(255, r)),
+                Math.max(0, Math.min(255, g)),
+                Math.max(0, Math.min(255, b)));
     }
 
     // ------------------------------------------------------------------

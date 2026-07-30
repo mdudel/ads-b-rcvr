@@ -258,6 +258,29 @@ public class Main {
             sinks.closeAll();
         }, "adsb-shutdown"));
 
+        // Periodic eviction: drop tracks whose age exceeds
+        // AircraftStateStore.REMOVE_AT_MS (default 150s = 120s fade
+        // start + 30s fade duration). Runs every 5s on a daemon
+        // scheduler so the JVM can still exit cleanly. Applies in both
+        // UI and CLI mode; without this, silent aircraft accumulate
+        // in the store forever (Marty 2026-07-30 12:47 UTC).
+        java.util.concurrent.ScheduledExecutorService evictor =
+                java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "adsb-evictor");
+                    t.setDaemon(true);
+                    return t;
+                });
+        evictor.scheduleAtFixedRate(() -> {
+            try {
+                stateStore.evictOlderThan(
+                        java.time.Duration.ofMillis(AircraftStateStore.REMOVE_AT_MS));
+            } catch (Exception e) {
+                System.err.println("[WARN] Eviction sweep error: " + e);
+            }
+        }, 5, 5, java.util.concurrent.TimeUnit.SECONDS);
+        Runtime.getRuntime().addShutdownHook(new Thread(evictor::shutdownNow,
+                "adsb-evictor-shutdown"));
+
         if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
             // UI mode: run the receiver on a daemon thread so the EDT
             // (and the Reconnect button) stays responsive. Thread
