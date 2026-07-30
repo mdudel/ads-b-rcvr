@@ -88,7 +88,7 @@ public final class MainFrame extends JFrame {
     /**
      * Legacy 12-arg convenience ctor for callers that don't need the
      * lastCertDir persistence (tests, headless smoke). Defers to the
-     * full ctor with no-op supplier/setter.
+     * full ctor with no-op supplier/setter and default brightness.
      */
     public MainFrame(String version,
                      AircraftStateStore store,
@@ -106,6 +106,11 @@ public final class MainFrame extends JFrame {
                 initialTheme, onThemeChanged, receiver, () -> null, s -> {});
     }
 
+    /**
+     * Legacy 14-arg convenience ctor for callers that don't need the
+     * brightness persistence (tests, headless smoke). Defers to the
+     * full ctor with brightness=1.0 and a no-op persistence setter.
+     */
     public MainFrame(String version,
                      AircraftStateStore store,
                      ConnectorStore connectorStore,
@@ -119,6 +124,28 @@ public final class MainFrame extends JFrame {
                      AdsbReceiver receiver,
                      java.util.function.Supplier<String> lastCertDirRef,
                      java.util.function.Consumer<String> lastCertDirSetter) {
+        this(version, store, connectorStore, attacher, liveBuilder,
+                initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                initialTheme, onThemeChanged, receiver,
+                lastCertDirRef, lastCertDirSetter,
+                1.0f, b -> {});
+    }
+
+    public MainFrame(String version,
+                     AircraftStateStore store,
+                     ConnectorStore connectorStore,
+                     ConnectorAttacher attacher,
+                     AtomicReference<CoTBuilder> liveBuilder,
+                     IcaoAircraftClassifier.Affiliation initialAffil,
+                     IcaoAircraftClassifier.Category    initialCat,
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver,
+                     java.util.function.Supplier<String> lastCertDirRef,
+                     java.util.function.Consumer<String> lastCertDirSetter,
+                     float initialMapBrightness,
+                     Consumer<Float> onMapBrightnessChanged) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -145,15 +172,26 @@ public final class MainFrame extends JFrame {
         setLocationRelativeTo(null);
 
         this.mapPanel         = new MapPanel(store);
+        // Apply persisted brightness BEFORE the panel first paints so
+        // the operator doesn't see a full-bright flash on start.
+        mapPanel.setBrightness(initialMapBrightness);
         this.tracksPanel      = new TracksPanel(store, mapPanel::centerOn);
         this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher,
                 lastCertDirRef, lastCertDirSetter);
+        // Compose the brightness callback: update the live MapPanel AND
+        // persist to disk so the setting survives a restart. Persistence
+        // is nullable-safe -- if the caller didn't wire it we still get
+        // in-session behaviour.
+        final Consumer<Float> brightnessSink = (onMapBrightnessChanged == null)
+                ? mapPanel::setBrightness
+                : b -> { mapPanel.setBrightness(b); onMapBrightnessChanged.accept(b); };
         this.settingsPanel    = new SettingsPanel(
                 initialAffil, initialCat, initialStaleAir, initialStaleGround,
                 (aff, cat, sa, sg) -> {
                     liveBuilder.set(new CoTBuilder(new IcaoAircraftClassifier(aff, cat), sa, sg));
                 },
-                mapPanel::setBrightness);
+                brightnessSink,
+                initialMapBrightness);
         this.aboutPanel       = new AboutPanel(version);
 
         this.sideDock = new SideDock(mapPanel);

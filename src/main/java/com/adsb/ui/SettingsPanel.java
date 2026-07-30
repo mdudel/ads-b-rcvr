@@ -38,11 +38,26 @@ public final class SettingsPanel extends JPanel {
     private final JSpinner staleGroundSpin;
     private final JSlider brightnessSlider;
 
+    /**
+     * Legacy 6-arg ctor: brightness starts at 1.0 (fully bright).
+     * Defers to the 7-arg primary ctor. Kept so headless tests + any
+     * pre-persistence caller stay green.
+     */
     public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
                          IcaoAircraftClassifier.Category    initialCat,
                          int initialStaleAir, int initialStaleGround,
                          SettingsListener onChange,
                          java.util.function.Consumer<Float> onBrightnessChanged) {
+        this(initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                onChange, onBrightnessChanged, 1.0f);
+    }
+
+    public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
+                         IcaoAircraftClassifier.Category    initialCat,
+                         int initialStaleAir, int initialStaleGround,
+                         SettingsListener onChange,
+                         java.util.function.Consumer<Float> onBrightnessChanged,
+                         float initialBrightness) {
         super(new GridBagLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
@@ -57,7 +72,10 @@ public final class SettingsPanel extends JPanel {
         this.staleAirSpin    = new JSpinner(new SpinnerNumberModel(initialStaleAir,    5,  3600, 5));
         this.staleGroundSpin = new JSpinner(new SpinnerNumberModel(initialStaleGround, 5, 86400, 30));
 
-        this.brightnessSlider = new JSlider(JSlider.HORIZONTAL, 0, 100, 100);
+        // Slider value is percent; brightness is 0.0-1.0. Clamp on the
+        // way in so a corrupted properties file can't wedge the slider.
+        int initialPct = Math.max(0, Math.min(100, Math.round(initialBrightness * 100f)));
+        this.brightnessSlider = new JSlider(JSlider.HORIZONTAL, 0, 100, initialPct);
         brightnessSlider.setMajorTickSpacing(25);
         brightnessSlider.setMinorTickSpacing(5);
         brightnessSlider.setPaintTicks(true);

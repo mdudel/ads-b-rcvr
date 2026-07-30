@@ -116,6 +116,13 @@ public class Main {
             initialTheme.apply();
         }
 
+        // Map brightness lives under ui.mapBrightness in the same
+        // properties file. Read here so MainFrame gets it via ctor;
+        // slider + MapPanel get initialised to the persisted value on
+        // first paint so the operator's darkness setting survives a
+        // restart (Marty 2026-07-30 07:26 UTC).
+        final float initialMapBrightness = readMapBrightness(storePath);
+
         ConnectorAttacher attacher = new ConnectorAttacher(sinks, stateStore, liveBuilder);
 
         // Turn CLI sink flags into transient in-memory connectors so they
@@ -207,7 +214,9 @@ public class Main {
                             newTheme -> writeThemeMode(storePath, newTheme),
                             uiReceiverRef,
                             () -> readLastCertDir(storePath),
-                            dir -> writeLastCertDir(storePath, dir));
+                            dir -> writeLastCertDir(storePath, dir),
+                            initialMapBrightness,
+                            b -> writeMapBrightness(storePath, b));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -374,6 +383,38 @@ public class Main {
     private static void writeLastCertDir(Path storePath, String dir) {
         if (dir == null || dir.isBlank()) return;
         writeUiProperty(storePath, "ui.lastCertDir", dir);
+    }
+
+    /**
+     * Read {@code ui.mapBrightness} from the shared properties file.
+     * Returns 1.0 (full brightness) when absent, out-of-range, or the
+     * file is unreadable -- matches MapPanel's constructor default.
+     * Values are clamped to [0.0, 1.0].
+     */
+    private static float readMapBrightness(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return 1.0f;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            String v = p.getProperty("ui.mapBrightness");
+            if (v == null || v.isBlank()) return 1.0f;
+            float f = Float.parseFloat(v.trim());
+            return Math.max(0.0f, Math.min(1.0f, f));
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.mapBrightness from "
+                    + storePath + ": " + e);
+            return 1.0f;
+        }
+    }
+
+    private static void writeMapBrightness(Path storePath, float brightness) {
+        float clamped = Math.max(0.0f, Math.min(1.0f, brightness));
+        // Fixed-locale format so a de-DE JVM doesn't write '0,75' which
+        // Float.parseFloat can't round-trip on the next launch.
+        String canonical = String.format(java.util.Locale.ROOT, "%.3f", clamped);
+        writeUiProperty(storePath, "ui.mapBrightness", canonical);
     }
 
     /**
