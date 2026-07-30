@@ -5,6 +5,7 @@ import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
 import com.adsb.enrichment.EnrichmentResolver;
 import com.adsb.model.AircraftStateStore;
+import com.adsb.model.TrackSmoothingRegistry;
 import com.adsb.ui.model.ConnectorAttacher;
 import com.adsb.ui.model.ConnectorStore;
 
@@ -133,9 +134,7 @@ public final class MainFrame extends JFrame {
     }
 
     /**
-     * Legacy 16-arg ctor: no enrichment resolver. Delegates to the
-     * 19-arg primary with a null resolver -- enrichment columns stay
-     * empty and the Settings enrichment row is hidden.
+     * Legacy 16-arg ctor: no enrichment resolver. Delegates.
      */
     public MainFrame(String version,
                      AircraftStateStore store,
@@ -160,6 +159,9 @@ public final class MainFrame extends JFrame {
                 null, () -> null, s -> {});
     }
 
+    /**
+     * Legacy 19-arg ctor: no track-smoothing registry.
+     */
     public MainFrame(String version,
                      AircraftStateStore store,
                      ConnectorStore connectorStore,
@@ -178,6 +180,36 @@ public final class MainFrame extends JFrame {
                      EnrichmentResolver enrichment,
                      java.util.function.Supplier<String> enrichmentDirRef,
                      java.util.function.Consumer<String> enrichmentDirSetter) {
+        this(version, store, connectorStore, attacher, liveBuilder,
+                initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                initialTheme, onThemeChanged, receiver,
+                lastCertDirRef, lastCertDirSetter,
+                initialMapBrightness, onMapBrightnessChanged,
+                enrichment, enrichmentDirRef, enrichmentDirSetter,
+                null, false, b -> {});
+    }
+
+    public MainFrame(String version,
+                     AircraftStateStore store,
+                     ConnectorStore connectorStore,
+                     ConnectorAttacher attacher,
+                     AtomicReference<CoTBuilder> liveBuilder,
+                     IcaoAircraftClassifier.Affiliation initialAffil,
+                     IcaoAircraftClassifier.Category    initialCat,
+                     int initialStaleAir, int initialStaleGround,
+                     ThemeMode initialTheme,
+                     Consumer<ThemeMode> onThemeChanged,
+                     AdsbReceiver receiver,
+                     java.util.function.Supplier<String> lastCertDirRef,
+                     java.util.function.Consumer<String> lastCertDirSetter,
+                     float initialMapBrightness,
+                     Consumer<Float> onMapBrightnessChanged,
+                     EnrichmentResolver enrichment,
+                     java.util.function.Supplier<String> enrichmentDirRef,
+                     java.util.function.Consumer<String> enrichmentDirSetter,
+                     TrackSmoothingRegistry smoothing,
+                     boolean initialSmoothingEnabled,
+                     Consumer<Boolean> onSmoothingChanged) {
         super("ADS-B Receiver \u2014 " + version);
         this.store           = store;
         this.connectorStore  = connectorStore;
@@ -203,7 +235,7 @@ public final class MainFrame extends JFrame {
         setSize(new Dimension(1200, 800));
         setLocationRelativeTo(null);
 
-        this.mapPanel         = new MapPanel(store);
+        this.mapPanel         = new MapPanel(store, smoothing);
         // Apply persisted brightness BEFORE the panel first paints so
         // the operator doesn't see a full-bright flash on start.
         mapPanel.setBrightness(initialMapBrightness);
@@ -235,7 +267,10 @@ public final class MainFrame extends JFrame {
                 initialMapBrightness,
                 enrichment,
                 enrichmentDirRef,
-                enrichmentDirSetter);
+                enrichmentDirSetter,
+                smoothing,
+                initialSmoothingEnabled,
+                onSmoothingChanged);
         this.aboutPanel       = new AboutPanel(version);
 
         this.sideDock = new SideDock(mapPanel);

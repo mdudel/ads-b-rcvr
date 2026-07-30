@@ -3,9 +3,11 @@ package com.adsb.ui;
 import com.adsb.cot.CoTBuilder;
 import com.adsb.cot.IcaoAircraftClassifier;
 import com.adsb.enrichment.EnrichmentResolver;
+import com.adsb.model.TrackSmoothingRegistry;
 
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
 import javax.swing.JFileChooser;
 import javax.swing.JLabel;
@@ -76,6 +78,9 @@ public final class SettingsPanel extends JPanel {
                 null, () -> null, s -> {});
     }
 
+    /**
+     * Legacy 10-arg ctor: no track-smoothing toggle.
+     */
     public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
                          IcaoAircraftClassifier.Category    initialCat,
                          int initialStaleAir, int initialStaleGround,
@@ -85,6 +90,24 @@ public final class SettingsPanel extends JPanel {
                          EnrichmentResolver enrichment,
                          Supplier<String> enrichmentDirRef,
                          Consumer<String> enrichmentDirSetter) {
+        this(initialAffil, initialCat, initialStaleAir, initialStaleGround,
+                onChange, onBrightnessChanged, initialBrightness,
+                enrichment, enrichmentDirRef, enrichmentDirSetter,
+                null, false, b -> {});
+    }
+
+    public SettingsPanel(IcaoAircraftClassifier.Affiliation initialAffil,
+                         IcaoAircraftClassifier.Category    initialCat,
+                         int initialStaleAir, int initialStaleGround,
+                         SettingsListener onChange,
+                         java.util.function.Consumer<Float> onBrightnessChanged,
+                         float initialBrightness,
+                         EnrichmentResolver enrichment,
+                         Supplier<String> enrichmentDirRef,
+                         Consumer<String> enrichmentDirSetter,
+                         TrackSmoothingRegistry smoothing,
+                         boolean initialSmoothingEnabled,
+                         Consumer<Boolean> onSmoothingChanged) {
         super(new GridBagLayout());
         setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
 
@@ -209,6 +232,32 @@ public final class SettingsPanel extends JPanel {
             gc.gridwidth = 1;
             y++;
             gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2; add(statusLbl, gc);
+            gc.gridwidth = 1;
+            y++;
+        }
+
+        // Track-smoothing toggle (Marty 2026-07-30 15:27 UTC, #16).
+        // Only shown when a registry was supplied; hidden in test /
+        // headless bootstraps that don't wire one.
+        if (smoothing != null) {
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2;
+            add(new JLabel("─ Track display ─"), gc);
+            gc.gridwidth = 1;
+            y++;
+            JCheckBox smoothToggle = new JCheckBox(
+                    "Smooth track paths (Kalman)", initialSmoothingEnabled);
+            smoothToggle.setFocusable(false);
+            smoothToggle.setToolTipText(
+                    "Apply a per-aircraft Kalman filter to displayed"
+                    + " positions + history trail. Display only --"
+                    + " store, table, popup, and CoT emissions stay raw.");
+            smoothToggle.addActionListener(e -> {
+                boolean on = smoothToggle.isSelected();
+                smoothing.setEnabled(on);
+                onSmoothingChanged.accept(on);
+            });
+            gc.gridx = 0; gc.gridy = y; gc.gridwidth = 2;
+            add(smoothToggle, gc);
             gc.gridwidth = 1;
             y++;
         }

@@ -2,6 +2,7 @@ package com.adsb.ui;
 
 import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
+import com.adsb.model.TrackSmoothingRegistry;
 
 import org.jxmapviewer.JXMapViewer;
 import org.jxmapviewer.input.CenterMapListener;
@@ -71,9 +72,26 @@ public final class MapPanel extends JPanel {
     /** Pixel radius for click hit-testing. Generous so touch-lite operators still hit. */
     private static final int CLICK_HIT_RADIUS_PX = 16;
 
+    /**
+     * Optional Kalman smoothing for the icon + trail. Null when the
+     * caller (MainFrame) opts out; when present, paint feeds every
+     * position through it before projecting. Raw store data (used by
+     * the tracks table, CoT emitters, and the details popup) is
+     * unaffected -- smoothing is a pure display concern.
+     */
+    private volatile TrackSmoothingRegistry smoothing;
+
+    /**
+     * Legacy 1-arg ctor for callers without a smoother.
+     */
     public MapPanel(AircraftStateStore store) {
+        this(store, null);
+    }
+
+    public MapPanel(AircraftStateStore store, TrackSmoothingRegistry smoothing) {
         super(new BorderLayout());
         this.store = store;
+        this.smoothing = smoothing;
 
         this.map = new JXMapViewer();
 
@@ -193,6 +211,27 @@ public final class MapPanel extends JPanel {
      */
     public void setOnTrackClicked(Consumer<AdsbTrack> handler) {
         this.onTrackClicked = handler;
+    }
+
+    /**
+     * Replace the smoothing registry (for late injection). Nullable
+     * to disable smoothing entirely.
+     */
+    public void setSmoothing(TrackSmoothingRegistry smoothing) {
+        this.smoothing = smoothing;
+        repaintPending = true;
+    }
+
+    /**
+     * Feed a raw measurement through the smoothing registry (if any
+     * and enabled) and return the smoothed lat/lon, or the raw
+     * values unchanged.
+     */
+    private double[] applySmoothing(String icaoHex, double lat, double lon,
+                                    java.time.Instant when) {
+        TrackSmoothingRegistry s = smoothing;
+        if (s == null || !s.isEnabled()) return new double[] { lat, lon };
+        return s.smooth(icaoHex, lat, lon, when);
     }
 
     /**
@@ -319,8 +358,16 @@ public final class MapPanel extends JPanel {
                     float alpha = AircraftStateStore.fadeAlphaFor(t, paintNow);
                     if (alpha <= 0.0f) continue;
 
+                    // Kalman smoothing (Marty 2026-07-30 15:27 UTC #16):
+                    // pipe the reported lat/lon through the per-aircraft
+                    // filter before projecting so both the icon AND its
+                    // trail read as a clean curve rather than a jaggy
+                    // sample-by-sample line. Store data unchanged --
+                    // this is a display-only smoother.
+                    double[] smoothed = applySmoothing(t.icaoHex(),
+                            t.latitude(), t.longitude(), t.lastSeen());
                     Point2D p = viewer.getTileFactory().geoToPixel(
-                            new GeoPosition(t.latitude(), t.longitude()),
+                            new GeoPosition(smoothed[0], smoothed[1]),
                             viewer.getZoom());
                     int x = (int) (p.getX() - vp.x);
                     int y = (int) (p.getY() - vp.y);
@@ -337,10 +384,27 @@ public final class MapPanel extends JPanel {
 
                     Color c = altitudeColour(t.preferredAltFt());
 
-                    // Draw trail first (behind the aircraft icon)
-                    List<AircraftStateStore.TrailPoint> trail = store.getTrail(t.icaoHex());
-                    if (trail.size() > 1) {
-                        g.setColor(c);
+                    // Draw trail first (behind the aircraft icon).
+                    // When smoothing is on, use the smoothed trail so
+                    // the history reads as a clean curve; when off,
+                    // use the store's raw trail (the pre-#16 shape).
+                    g.setColor(c);
+                    TrackSmoothingRegistry sm = smoothing;
+                    if (sm != null && sm.isEnabled()) {
+                        List<double[]> smoothedTrail = sm.getSmoothedTrail(t.icaoHex());
+                        for (int i = 1; i < smoothedTrail.size(); i++) {
+                            double[] p1 = smoothedTrail.get(i - 1);
+                            double[] p2 = smoothedTrail.get(i);
+                            Point2D px1 = viewer.getTileFactory().geoToPixel(
+                                    new GeoPosition(p1[0], p1[1]), viewer.getZoom());
+                            Point2D px2 = viewer.getTileFactory().geoToPixel(
+                                    new GeoPosition(p2[0], p2[1]), viewer.getZoom());
+                            g.drawLine(
+                                    (int) (px1.getX() - vp.x), (int) (px1.getY() - vp.y),
+                                    (int) (px2.getX() - vp.x), (int) (px2.getY() - vp.y));
+                        }
+                    } else {
+                        List<AircraftStateStore.TrailPoint> trail = store.getTrail(t.icaoHex());
                         for (int i = 1; i < trail.size(); i++) {
                             AircraftStateStore.TrailPoint p1 = trail.get(i - 1);
                             AircraftStateStore.TrailPoint p2 = trail.get(i);
@@ -348,11 +412,9 @@ public final class MapPanel extends JPanel {
                                     new GeoPosition(p1.lat(), p1.lon()), viewer.getZoom());
                             Point2D px2 = viewer.getTileFactory().geoToPixel(
                                     new GeoPosition(p2.lat(), p2.lon()), viewer.getZoom());
-                            int x1 = (int) (px1.getX() - vp.x);
-                            int y1 = (int) (px1.getY() - vp.y);
-                            int x2 = (int) (px2.getX() - vp.x);
-                            int y2 = (int) (px2.getY() - vp.y);
-                            g.drawLine(x1, y1, x2, y2);
+                            g.drawLine(
+                                    (int) (px1.getX() - vp.x), (int) (px1.getY() - vp.y),
+                                    (int) (px2.getX() - vp.x), (int) (px2.getY() - vp.y));
                         }
                     }
 

@@ -15,6 +15,7 @@ import com.adsb.enrichment.EnrichmentResolver;
 import com.adsb.enrichment.LocalCsvEnrichmentSource;
 import com.adsb.enrichment.OpenSkyApiEnrichmentSource;
 import com.adsb.model.AircraftStateStore;
+import com.adsb.model.TrackSmoothingRegistry;
 import com.adsb.ui.MainFrame;
 import com.adsb.ui.ThemeMode;
 import com.adsb.ui.model.Connector;
@@ -126,6 +127,17 @@ public class Main {
         // first paint so the operator's darkness setting survives a
         // restart (Marty 2026-07-30 07:26 UTC).
         final float initialMapBrightness = readMapBrightness(storePath);
+
+        // Track smoothing registry (Marty 2026-07-30 15:27 UTC, #16).
+        // Off by default (issue asks for a TOGGLE); operator flips it
+        // in Settings, choice persists via ui.trackSmoothing.
+        final boolean initialSmoothing = readTrackSmoothing(storePath);
+        final TrackSmoothingRegistry smoothingRegistry;
+        if (cfg.ui && !GraphicsEnvironment.isHeadless()) {
+            smoothingRegistry = new TrackSmoothingRegistry(initialSmoothing);
+        } else {
+            smoothingRegistry = null;
+        }
 
         // Aircraft-metadata enrichment (Marty 2026-07-30 14:05 UTC):
         // resolve ICAO24 -> registration/type/operator from a chain of
@@ -276,7 +288,10 @@ public class Main {
                                     // note as a followup.
                                     enrichmentResolverRef.localDir().reload();
                                 }
-                            });
+                            },
+                            smoothingRegistry,
+                            initialSmoothing,
+                            on -> writeTrackSmoothing(storePath, on));
                     frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
                     // Belt-and-braces: even though initialTheme.apply()
                     // ran BEFORE this invokeLater lambda was scheduled,
@@ -334,6 +349,11 @@ public class Main {
             try {
                 stateStore.evictOlderThan(
                         java.time.Duration.ofMillis(AircraftStateStore.REMOVE_AT_MS));
+                // Piggy-back the smoothing-registry cleanup on the same
+                // sweep so its per-track memory tracks aircraft memory.
+                if (smoothingRegistry != null) {
+                    smoothingRegistry.evictOlderThan(java.time.Instant.now());
+                }
             } catch (Exception e) {
                 System.err.println("[WARN] Eviction sweep error: " + e);
             }
@@ -525,6 +545,31 @@ public class Main {
     private static void writeEnrichmentDir(Path storePath, String dir) {
         if (dir == null || dir.isBlank()) return;
         writeUiProperty(storePath, "ui.enrichmentDir", dir);
+    }
+
+    /**
+     * Read {@code ui.trackSmoothing} from the shared properties file.
+     * Returns false when absent or unparseable so smoothing stays
+     * off by default (matches the issue: 'add a TOGGLE button').
+     */
+    private static boolean readTrackSmoothing(Path storePath) {
+        try {
+            if (!java.nio.file.Files.exists(storePath)) return false;
+            java.util.Properties p = new java.util.Properties();
+            try (var in = java.nio.file.Files.newBufferedReader(storePath)) {
+                p.load(in);
+            }
+            String v = p.getProperty("ui.trackSmoothing");
+            return v != null && Boolean.parseBoolean(v.trim());
+        } catch (Exception e) {
+            System.err.println("[WARN] Could not read ui.trackSmoothing from "
+                    + storePath + ": " + e);
+            return false;
+        }
+    }
+
+    private static void writeTrackSmoothing(Path storePath, boolean on) {
+        writeUiProperty(storePath, "ui.trackSmoothing", Boolean.toString(on));
     }
 
     /**
