@@ -31,6 +31,7 @@ import java.awt.Component;
 import java.awt.Cursor;
 import java.awt.Dimension;
 import java.awt.FlowLayout;
+import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
@@ -145,13 +146,20 @@ public final class ConnectorsPanel extends JPanel {
     /**
      * Build one card for a connector.
      *
-     * <p><b>Layout</b> (post-2026-07-29 16:05 UTC fix):
+     * <p><b>Layout</b> (post-2026-07-30 07:2x UTC icon refactor):
      * <pre>
      *   +--------------------------------------------------+
-     *   | [Stop] [Edit\u2026] [Remove]  ● Name                    |  (buttons first,
+     *   | [\u25C0] [\u2699] [\u2715]  \u25CF Name                          |  (icon buttons first,
      *   |                       Type -> long/topic [COT]   |   info stretches)
      *   +--------------------------------------------------+
      * </pre>
+     *
+     * <p>Marty 2026-07-30 07:21 UTC: replace the text buttons with
+     * flat icon glyphs. Toggle button flips between a green left-
+     * pointing triangle (start, when stopped) and a red square (stop,
+     * when running). Edit = cog. Remove = X. All three are single
+     * Unicode glyphs so no image assets ship in the jar and the icons
+     * render on every Swing L&F.
      *
      * <p>Marty's 15:56 UTC screenshot showed the previous 'buttons on
      * the far right' shape: buttons WERE visible but got shoved to
@@ -163,21 +171,25 @@ public final class ConnectorsPanel extends JPanel {
      * clipped no matter how wide the info wants to be.
      */
     private JPanel buildRow(Connector c) {
-        // --- Buttons (left side, always visible) ---
-        JButton toggleBtn = new JButton(c.enabled() ? "Stop" : "Start");
-        toggleBtn.setForeground(c.enabled() ? new Color(0xC0, 0x39, 0x2B) : new Color(0x27, 0xAE, 0x60));
-        toggleBtn.setFocusable(false);
-        toggleBtn.setToolTipText(c.enabled()
-                ? "Detach and disable this connector (stops sending)"
-                : "Enable and attach this connector (starts sending)");
+        // --- Buttons (left side, always visible; flat icon glyphs) ---
+        // Toggle: green left-pointing triangle when stopped (click to start),
+        // red filled square when running (click to stop).
+        String toggleGlyph = c.enabled() ? "\u25A0" : "\u25C0";
+        Color  toggleColor = c.enabled() ? new Color(0xC0, 0x39, 0x2B)
+                                         : new Color(0x27, 0xAE, 0x60);
+        JButton toggleBtn = iconButton(toggleGlyph, toggleColor,
+                c.enabled()
+                        ? "Stop this connector (detach + disable)"
+                        : "Start this connector (enable + attach)");
         toggleBtn.addActionListener(e -> onToggle(c));
 
-        JButton editBtn = new JButton("Edit\u2026");
-        editBtn.setFocusable(false);
+        // Edit: cog
+        JButton editBtn = iconButton("\u2699", null, "Edit connector\u2026");
         editBtn.addActionListener(e -> onEdit(c));
 
-        JButton removeBtn = new JButton("Remove");
-        removeBtn.setFocusable(false);
+        // Remove: X (muted red so it reads as destructive)
+        JButton removeBtn = iconButton("\u2715", new Color(0xC0, 0x39, 0x2B),
+                "Remove connector");
         removeBtn.addActionListener(e -> onRemove(c));
 
         JPanel buttonStrip = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
@@ -233,6 +245,32 @@ public final class ConnectorsPanel extends JPanel {
         info.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
         return row;
+    }
+
+    /**
+     * Build a compact, flat icon button carrying a single Unicode
+     * glyph. Fixed 28x24 preferred size so the three-button strip
+     * has a stable footprint regardless of glyph metrics. No border
+     * fill, no focus paint -- FlatLaf gives us hover feedback for
+     * free via the L&F rollover paint.
+     */
+    private static JButton iconButton(String glyph, Color fg, String tooltip) {
+        JButton b = new JButton(glyph);
+        if (fg != null) b.setForeground(fg);
+        b.setFocusable(false);
+        b.setFocusPainted(false);
+        b.setToolTipText(tooltip);
+        // Slightly larger, bolder glyph so the icon reads at a glance.
+        Font base = b.getFont();
+        b.setFont(base.deriveFont(Font.BOLD, Math.max(14f, base.getSize2D() + 2f)));
+        b.setMargin(new Insets(2, 4, 2, 4));
+        Dimension sz = new Dimension(28, 24);
+        b.setPreferredSize(sz);
+        b.setMinimumSize(sz);
+        b.setMaximumSize(sz);
+        // Squared corners + minimal chrome -> flat look on FlatLaf.
+        b.putClientProperty("JButton.buttonType", "square");
+        return b;
     }
 
     private static Color borderColorFor(Connector c) {
