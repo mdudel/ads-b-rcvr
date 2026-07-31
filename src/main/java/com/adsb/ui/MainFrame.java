@@ -284,6 +284,27 @@ public final class MainFrame extends JFrame {
         this.tracksPanel      = new TracksPanel(store, enrichment,
                 mapPanel::centerOn, openDetails);
         mapPanel.setOnTrackClicked(openDetails);
+
+        // Issue #11: wire per-type SVG icon rendering into the map.
+        // AircraftIconService loads PNGs eagerly; a failed init just
+        // means the map keeps drawing the fallback triangle glyph.
+        if (enrichment != null) {
+            try {
+                AircraftIconService iconService = new AircraftIconService();
+                mapPanel.setIconService(iconService);
+                mapPanel.setEnrichmentResolver(enrichment);
+                // When an async enrichment lookup completes, repaint
+                // the map on the EDT so the icon upgrades from generic
+                // to type-specific as soon as metadata arrives.
+                // Adds alongside any existing listener (addListener
+                // fans-out rather than replacing).
+                enrichment.addListener(e ->
+                        SwingUtilities.invokeLater(mapPanel::repaint));
+            } catch (Exception ex) {
+                System.err.println("[WARN] AircraftIconService init failed, " +
+                        "falling back to triangle glyph: " + ex);
+            }
+        }
         this.connectorsPanel  = new ConnectorsPanel(connectorStore, attacher,
                 lastCertDirRef, lastCertDirSetter);
         // Compose the brightness callback: update the live MapPanel AND

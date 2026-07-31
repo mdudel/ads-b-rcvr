@@ -1,5 +1,7 @@
 package com.adsb.ui;
 
+import com.adsb.enrichment.Enrichment;
+import com.adsb.enrichment.EnrichmentResolver;
 import com.adsb.model.AdsbTrack;
 import com.adsb.model.AircraftStateStore;
 import com.adsb.model.TrackSmoothingRegistry;
@@ -33,6 +35,7 @@ import java.awt.event.MouseEvent;
 import java.awt.geom.AffineTransform;
 import java.awt.geom.Path2D;
 import java.awt.geom.Point2D;
+import java.awt.image.BufferedImage;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -80,6 +83,19 @@ public final class MapPanel extends JPanel {
      * unaffected -- smoothing is a pure display concern.
      */
     private volatile TrackSmoothingRegistry smoothing;
+
+    /**
+     * Per-type SVG icon service (issue #11). Null until
+     * {@link #setIconService} is called; falls back to the triangle
+     * glyph when null so pre-wiring startup is still safe.
+     */
+    private volatile AircraftIconService iconService;
+
+    /**
+     * Enrichment resolver used to look up aircraft type from ICAO hex.
+     * Null until {@link #setEnrichmentResolver} is called.
+     */
+    private volatile EnrichmentResolver enrichmentResolver;
 
     /**
      * Legacy 1-arg ctor for callers without a smoother.
@@ -211,6 +227,25 @@ public final class MapPanel extends JPanel {
      */
     public void setOnTrackClicked(Consumer<AdsbTrack> handler) {
         this.onTrackClicked = handler;
+    }
+
+    /**
+     * Wire in the icon service (issue #11). Nullable — falls back to
+     * the legacy triangle glyph when null.
+     */
+    public void setIconService(AircraftIconService s) {
+        this.iconService = s;
+        repaintPending = true;
+    }
+
+    /**
+     * Wire in the enrichment resolver so the painter can map ICAO hex
+     * to aircraft type (issue #11). Nullable — falls back to the
+     * legacy triangle glyph when null.
+     */
+    public void setEnrichmentResolver(EnrichmentResolver r) {
+        this.enrichmentResolver = r;
+        repaintPending = true;
     }
 
     /**
@@ -421,7 +456,19 @@ public final class MapPanel extends JPanel {
                     }
 
                     double heading = Double.isNaN(t.trackDeg()) ? 0.0 : t.trackDeg();
-                    drawAircraftGlyph(g, x, y, heading, c);
+
+                    // Issue #11: render per-type SVG icon when the
+                    // icon service and enrichment resolver are wired in;
+                    // otherwise fall back to the legacy triangle glyph.
+                    AircraftIconService svc = iconService;
+                    EnrichmentResolver er  = enrichmentResolver;
+                    if (svc != null && er != null) {
+                        Enrichment enr = er.lookup(t.icaoHex()).orElse(null);
+                        BufferedImage icon = svc.iconFor(enr, c, 22);
+                        drawAircraftIcon(g, x, y, heading, icon);
+                    } else {
+                        drawAircraftGlyph(g, x, y, heading, c);
+                    }
 
                     // Emergency ring: draw a red circle around distressed
                     // aircraft (squawk 7500/7600/7700 or ADS-B emergency
@@ -444,6 +491,28 @@ public final class MapPanel extends JPanel {
             } finally {
                 g.dispose();
             }
+        }
+    }
+
+    /**
+     * Draw a pre-rasterised icon centred on (cx, cy), rotated by
+     * {@code headingDeg} degrees. Guards {@code icon == null} by
+     * falling back to the triangle glyph.
+     */
+    private void drawAircraftIcon(Graphics2D g, int cx, int cy,
+                                   double headingDeg, BufferedImage icon) {
+        if (icon == null) {
+            drawAircraftGlyph(g, cx, cy, headingDeg, Color.LIGHT_GRAY);
+            return;
+        }
+        AffineTransform old = g.getTransform();
+        try {
+            g.translate(cx, cy);
+            g.rotate(Math.toRadians(headingDeg));
+            int half = icon.getWidth() / 2;
+            g.drawImage(icon, -half, -half, null);
+        } finally {
+            g.setTransform(old);
         }
     }
 
